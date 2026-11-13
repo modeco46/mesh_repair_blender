@@ -1,0 +1,5 @@
+meshlib==3.1.4.297
+numpy==2.2.4
+scipy==1.16.3
+pytest==9.2.0
+ruff==0.14.5

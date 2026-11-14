@@ -28,6 +28,7 @@ jobs:
   package:
     needs: test
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: windows-x64
@@ -48,7 +49,8 @@ jobs:
           BLENDER_TEST_DIR: ${{ runner.temp }}/blender-test
         run: |
           mkdir -p "$BLENDER_TEST_DIR"
-          curl -fL --retry 3 https://download.blender.org/release/Blender5.3/blender-5.3.0-linux-x64.tar.xz -o "$BLENDER_TEST_DIR/blender.tar.xz"
+          curl -fL --retry 3 https://download.blender.org/release/Blender5.3/blender-5.3.0-linux-x64.tar.xz -o "$BLENDER_TEST_DIR/blender.tar.xz" || curl -fL --retry 3 https://ftp.halifax.rwth-aachen.de/blender/release/Blender5.3/blender-5.3.0-linux-x64.tar.xz -o "$BLENDER_TEST_DIR/blender.tar.xz"
+          echo "dacb8264197a3f7fda6001285a5a506fc97ee943881261c2c3bd63c882f22e05  $BLENDER_TEST_DIR/blender.tar.xz" | sha256sum --check
           tar -xf "$BLENDER_TEST_DIR/blender.tar.xz" -C "$BLENDER_TEST_DIR"
           unzip -q dist/mesh-repair-blender-1.1.0-linux-x64.zip -d "$BLENDER_TEST_DIR/addon"
           export MESH_REPAIR_ADDON_ROOT="$BLENDER_TEST_DIR/addon"

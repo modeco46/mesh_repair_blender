@@ -181,7 +181,8 @@ def _update_summary(runtime, report, operation):
     if operation == "check":
         before = after = report.get("info", {})
     else:
-        before, after = report.get("before", {}), report.get("after", {})
+        before = report.get("before", {})
+        after = report.get("after", report.get("reconstruction_validation", {}))
     runtime.triangles_before = int(before.get("triangles", 0) or 0)
     runtime.triangles_after = int(after.get("triangles", 0) or 0)
     runtime.components = int(after.get("components", 0) or 0)
@@ -191,7 +192,7 @@ def _update_summary(runtime, report, operation):
     acceleration = report.get("acceleration", {})
     devices = [str(report.get("compute_device", "")), *acceleration.get("projection_backends", [])]
     runtime.backend = "CPU + CUDA" if any("cuda" in value.lower() for value in devices) else "CPU"
-    runtime.has_result = True
+    runtime.has_result = bool(before or after)
 
 
 def _finish_job(context, job):
@@ -210,7 +211,19 @@ def _finish_job(context, job):
             return
         if not result:
             runtime.stage = "Ошибка"
-            runtime.message = f"Worker завершился с кодом {job['process'].returncode}. См. worker.log."
+            runtime.message = (f"Процесс завершился с кодом {job['process'].returncode}. "
+                               "Подробности сохранены в JSON-отчёте.")
+            log_path = job["directory"] / "worker.log"
+            log_tail = ""
+            if log_path.is_file():
+                with log_path.open("rb") as stream:
+                    stream.seek(max(0, log_path.stat().st_size - 16_384))
+                    log_tail = stream.read().decode("utf-8", errors="replace")
+            report = {"status": "error", "error": runtime.message,
+                      "operation": job["operation"], "returncode": job["process"].returncode,
+                      "settings": json.loads(job["settings"].read_text(encoding="utf-8")),
+                      "blender_source_objects": job["source_names"], "worker_log_tail": log_tail}
+            runtime.report_text = _store_report(job["result_name"], report).name
             return
         status = result.get("status")
         if job["operation"] == "heatmap":
@@ -293,6 +306,7 @@ def _begin(context, operation, operator, force_no_sharp=False):
     runtime.retry_available = False
     if operation != "heatmap":
         runtime.has_result = False
+        runtime.report_text = ""
     _redraw(context)
     try:
         parent = None

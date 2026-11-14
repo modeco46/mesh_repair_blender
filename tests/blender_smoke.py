@@ -55,6 +55,7 @@ def main():
         repaired = create_mesh_object(bpy.context, folder / "vertices.npy", folder / "faces.npy",
                                       "Cube_repaired", exported["mm_per_blender_unit"])
         assert len(repaired.data.polygons) == 12
+        assert not any(face.use_smooth for face in repaired.data.polygons)
         heatmap.attach(repaired, np.linspace(0, .04, len(repaired.data.vertices)), .02)
         assert heatmap.available(repaired)
         spaces = [a.spaces.active for a in bpy.context.screen.areas if a.type == "VIEW_3D"]

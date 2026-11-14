@@ -115,6 +115,7 @@ def create_mesh_object(context, vertices_path, faces_path, name: str, mm_per_uni
     mesh.polygons.add(len(faces))
     mesh.polygons.foreach_set("loop_start", np.arange(0, loop_count, 3, dtype=np.int32))
     mesh.polygons.foreach_set("loop_total", np.full(len(faces), 3, dtype=np.int32))
+    mesh.polygons.foreach_set("use_smooth", np.zeros(len(faces), dtype=np.bool_))
     mesh.update(calc_edges=True)
     mesh.validate(clean_customdata=False)
     result = bpy.data.objects.new(name, mesh)

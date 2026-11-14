@@ -11,11 +11,7 @@ permissions:
 
 jobs:
   test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -27,38 +23,35 @@ jobs:
 
   package:
     needs: test
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: windows-x64
-            os: windows-latest
-          - target: linux-x64
-            os: ubuntu-latest
-    runs-on: ${{ matrix.os }}
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: python scripts/build_release.py --target ${{ matrix.target }}
-      - run: python scripts/smoke_release.py dist/mesh-repair-blender-1.1.1-${{ matrix.target }}.zip
-      - name: Check Blender 5.3 panel, progress and heatmap
-        if: runner.os == 'Linux'
+      - run: python scripts/build_release.py --target windows-x64
+      - run: python scripts/smoke_release.py dist/mesh-repair-blender-1.1.2-windows-x64.zip
+      - name: Check Blender 5.3 on Windows
         env:
           BLENDER_TEST_DIR: ${{ runner.temp }}/blender-test
         run: |
-          mkdir -p "$BLENDER_TEST_DIR"
-          curl -fL --retry 3 https://download.blender.org/release/Blender5.3/blender-5.3.0-linux-x64.tar.xz -o "$BLENDER_TEST_DIR/blender.tar.xz" || curl -fL --retry 3 https://ftp.halifax.rwth-aachen.de/blender/release/Blender5.3/blender-5.3.0-linux-x64.tar.xz -o "$BLENDER_TEST_DIR/blender.tar.xz"
-          echo "dacb8264197a3f7fda6001285a5a506fc97ee943881261c2c3bd63c882f22e05  $BLENDER_TEST_DIR/blender.tar.xz" | sha256sum --check
-          tar -xf "$BLENDER_TEST_DIR/blender.tar.xz" -C "$BLENDER_TEST_DIR"
-          unzip -q dist/mesh-repair-blender-1.1.1-linux-x64.zip -d "$BLENDER_TEST_DIR/addon"
-          export MESH_REPAIR_ADDON_ROOT="$BLENDER_TEST_DIR/addon"
-          export MESH_REPAIR_PYTHON="$BLENDER_TEST_DIR/blender-5.3.0-linux-x64/5.3/python/bin/python3.13"
-          "$BLENDER_TEST_DIR/blender-5.3.0-linux-x64/blender" --background --factory-startup --python-exit-code 1 --python tests/blender_smoke.py
-          "$BLENDER_TEST_DIR/blender-5.3.0-linux-x64/blender" --background --factory-startup --python-exit-code 1 --python tests/blender_ui_smoke.py
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force $env:BLENDER_TEST_DIR | Out-Null
+          $archive = Join-Path $env:BLENDER_TEST_DIR 'blender.zip'
+          curl.exe -fL --retry 3 https://ftp.halifax.rwth-aachen.de/blender/release/Blender5.3/blender-5.3.0-windows-x64.zip -o $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Blender download failed' }
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLower() -ne '3ac567a63d59d9934f7b9213bfb27ba05760e1fb366f8f55c381573ec3eabfa8') { throw 'Blender checksum mismatch' }
+          Expand-Archive $archive $env:BLENDER_TEST_DIR
+          $blender = Join-Path $env:BLENDER_TEST_DIR 'blender-5.3.0-windows-x64'
+          $env:MESH_REPAIR_ADDON_ROOT = Join-Path $env:BLENDER_TEST_DIR 'addon'
+          Expand-Archive dist/mesh-repair-blender-1.1.2-windows-x64.zip $env:MESH_REPAIR_ADDON_ROOT
+          $env:MESH_REPAIR_PYTHON = Join-Path $blender '5.3/python/bin/python.exe'
+          & "$blender/blender.exe" --background --factory-startup --python-exit-code 1 --python tests/blender_smoke.py
+          if ($LASTEXITCODE -ne 0) { throw 'Blender smoke test failed' }
+          & "$blender/blender.exe" --background --factory-startup --python-exit-code 1 --python tests/blender_ui_smoke.py
+          if ($LASTEXITCODE -ne 0) { throw 'Blender UI smoke test failed' }
       - uses: actions/upload-artifact@v4
         with:
-          name: mesh-repair-blender-1.1.1-${{ matrix.target }}
+          name: mesh-repair-blender-1.1.2-windows-x64
           path: dist/*.zip
           retention-days: 30

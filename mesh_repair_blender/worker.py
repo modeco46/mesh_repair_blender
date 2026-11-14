@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import os
 from pathlib import Path
@@ -33,8 +34,14 @@ def _atomic_json(path: Path, value) -> None:
 class Channel:
     def __init__(self, path: Path):
         self.stream = path.open("a", encoding="utf-8", buffering=1)
+        self.last_progress = None
+        self.log_tail = deque(maxlen=100)
 
     def send(self, kind: str, value) -> None:
+        if kind == "progress":
+            self.last_progress = value
+        elif kind == "log":
+            self.log_tail.append(value)
         self.stream.write(json.dumps({"type": kind, "value": value}, ensure_ascii=False, allow_nan=False) + "\n")
 
     def close(self) -> None:
@@ -112,8 +119,17 @@ def main(argv=None) -> int:
                                            "report": str(report_path)})
             return 2
         trace_path = args.job_dir.parent / "worker-error.txt"
-        trace_path.write_text(traceback.format_exc(), encoding="utf-8")
-        _atomic_json(args.result_file, {"status": "error", "message": str(exc), "trace": str(trace_path)})
+        trace = traceback.format_exc()
+        trace_path.write_text(trace, encoding="utf-8")
+        report = dict(getattr(exc, "report", {}))
+        report.update(status="error", error=str(exc), operation=args.operation,
+                      last_progress=channel.last_progress, log_tail=list(channel.log_tail), traceback=trace)
+        if "settings" not in report and "values" in locals():
+            report["settings"] = values
+        report_path = args.job_dir.parent / "report.json"
+        _atomic_json(report_path, clean_json(report))
+        _atomic_json(args.result_file, {"status": "error", "message": str(exc), "trace": str(trace_path),
+                                       "report": str(report_path)})
         return 1
     finally:
         channel.close()

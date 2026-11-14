@@ -30,7 +30,7 @@ class Settings:
     sharpening_fallback_max_seconds: float = 120.0
     union_max_seconds: float = 240.0
     voxel_warn_seconds: float = 600.0
-    voxel_max_cells: float = 6e9
+    voxel_max_cells: float = 6e9  # Warning threshold; streamed grids are not resident in full.
 
     def validate(self):
         if not math.isfinite(self.quality_mm) or not .001 <= self.quality_mm <= .5:
@@ -46,7 +46,7 @@ class Settings:
         if not math.isfinite(self.voxel_warn_seconds) or self.voxel_warn_seconds < 0:
             raise ValueError('Некорректный порог предупреждения о времени вокселизации.')
         if not math.isfinite(self.voxel_max_cells) or self.voxel_max_cells <= 0:
-            raise ValueError('Некорректный предел размера воксельной сетки.')
+            raise ValueError('Некорректный порог предупреждения о размере воксельной сетки.')
 
 
 class SharpeningRetryRequired(RuntimeError):
@@ -257,16 +257,23 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
         return [max(1, int(math.ceil(float(value)/step))+2) for value in (extent.x, extent.y, extent.z)]
 
     grid = grid_for(settings.quality_mm)
+    if max(grid) >= 2**31 or math.prod(grid) >= 2**63:
+        raise RuntimeError('Размеры воксельной сетки выходят за диапазон индексов MeshLib. '
+                           'Проверьте масштаб модели и допуск в миллиметрах.')
     cells = float(grid[0])*grid[1]*grid[2]
     report['voxel_estimate'] = {'triangles': estimate, 'method': 'bbox_cells_timed_probe',
-                              'grid': grid, 'cells': cells, 'estimated_seconds': None}
+                              'grid': grid, 'cells': cells, 'estimated_seconds': None,
+                              'storage': 'streamed_layers' if cells > DENSE_WINDING_VOXEL_LIMIT else 'openvdb',
+                              'estimate_scope': 'voxel_reconstruction_only'}
     estimated_seconds = cells*1.3e-6   # conservative CPU figure until the timed probe calibrates it
     emit(f'Воксельная сетка {grid[0]}×{grid[1]}×{grid[2]} ≈ {cells/1e6:,.0f} млн ячеек; '
          f'поверхность ≈ {estimate:,} треугольников (площадь / шаг²).')
     if cells > settings.voxel_max_cells:
-        limit_step = settings.quality_mm*(cells/settings.voxel_max_cells)**(1/3)
-        raise RuntimeError(f'Воксельная сетка слишком велика ({cells/1e9:.1f} млрд ячеек): расчёт займёт часы. '
-                           f'Увеличьте допуск до {math.ceil(limit_step*1000)/1000:g} мм или больше.')
+        message = (f'Большая воксельная сетка ({cells/1e9:.1f} млрд ячеек) рассчитывается по слоям. '
+                   'Весь объём одновременно не хранится; скорость оценивается пробой. '
+                   'Плотная итоговая поверхность всё равно требует оперативной памяти.')
+        report['warnings'].append(message)
+        emit(message)
     winding = None
     try:
         cuda = None if settings.disable_cuda else cuda_module()
@@ -276,11 +283,12 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
         report['warnings'].append(f'CUDA недоступна, используется CPU: {exc}')
     report['voxel_passes'] = []
 
-    def reconstruct(sharpen, step, probe=False, stage=None, span=None):
+    def reconstruct(sharpen, step, probe=False, stage=None, span=None, winding_beta=2.0):
         nonlocal winding
         params = mm.GeneralOffsetParameters() if sharpen else mm.OffsetParameters()
         params.voxelSize = step
         params.signDetectionMode = mm.SignDetectionMode.HoleWindingRule
+        params.windingNumberBeta = winding_beta
         stage = stage or ('Проба острых рёбер (шаг ×4)' if probe else 'Восстановление поверхности')
         start, end = span or ((32, 41) if probe else (42, 65))
         grid_cells = math.prod(grid_for(step))
@@ -304,7 +312,7 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
         report['compute_device'] = device
         item = {'probe': probe, 'sharpening': sharpen, 'voxel_size_mm': step, 'compute_device': device,
                 'timing': timing, 'backend': backend, 'streaming': streaming,
-                'grid_cells': grid_cells, 'cpu_closed_surface_band': narrow_band}
+                'grid_cells': grid_cells, 'cpu_closed_surface_band': narrow_band, 'winding_beta': winding_beta}
         report['voxel_passes'].append(item)
         started = time.monotonic()
         emit(f'{stage}: шаг {step:g} мм; backend={backend}; compute_device={device}.')
@@ -331,21 +339,28 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
             emit(f"{stage}: {item['elapsed_seconds']:.2f} с; compute_device={report['compute_device']}.")
 
     if cells >= 30e6:
-        # Voxel time follows the number of grid cells of the bounding box, not the surface area, so a thin
-        # ring with an empty centre is far slower than area/step² suggests. A 64× cheaper pass calibrates it.
-        probe_step = settings.quality_mm*4
+        # Bound the probe itself for very fine grids. Total cells estimate work,
+        # not peak memory of the layer-wise CPU/CUDA implementation.
+        probe_factor = max(4, math.ceil((cells/4_000_000)**(1/3)))
+        probe_step = settings.quality_mm*probe_factor
         probe_grid = grid_for(probe_step)
         probe_cells = float(probe_grid[0])*probe_grid[1]*probe_grid[2]
         started_probe = time.monotonic()
-        reconstruct(False, probe_step, probe=True, stage='Оценка времени (шаг ×4)', span=(41, 42))
+        probe_mesh = reconstruct(False, probe_step, probe=True,
+                                 stage=f'Оценка времени (шаг ×{probe_factor})', span=(41, 42))
         probe_seconds = time.monotonic()-started_probe
+        output_triangles = probe_mesh.topology.numValidFaces()*probe_factor**2
+        del probe_mesh
         eta = estimated_seconds = probe_seconds*cells/probe_cells
-        report['voxel_estimate'].update(estimated_seconds=eta, probe_seconds=probe_seconds, probe_cells=probe_cells)
-        emit(f'Оценка времени воксельного расчёта по пробе (шаг ×4): ≈ {eta:,.0f} с.')
+        report['voxel_estimate'].update(estimated_seconds=eta, probe_seconds=probe_seconds, probe_cells=probe_cells,
+                                       probe_factor=probe_factor, estimated_output_triangles=output_triangles)
+        emit(f'Оценка только воксельного расчёта по пробе (шаг ×{probe_factor}): ≈ {eta:,.0f} с; '
+             f'промежуточная поверхность ≈ {output_triangles:,} треугольников. '
+             'Проверка и упрощение требуют дополнительного времени.')
         if eta > settings.voxel_warn_seconds:
-            target = math.ceil(settings.quality_mm*(eta/300.0)**(1/3)*1000)/1000
-            message = (f'Воксельный расчёт займёт около {eta/60:.0f} мин при допуске {settings.quality_mm:g} мм. '
-                       f'Допуск {target:g} мм даст примерно 5 минут.')
+            message = (f'Оценка воксельного расчёта: около {eta/60:.0f} мин при допуске '
+                       f'{settings.quality_mm:g} мм, без проверки и упрощения. '
+                       'Оценка приблизительная; расчёт продолжается с выбранным допуском.')
             report['warnings'].append(message)
             emit(message)
 
@@ -376,13 +391,28 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
             warning = f'Sharpening отклонён на грубой пробе: {exc}. Полный расчёт — обычные воксели.'
             report['warnings'].append(warning)
             emit(warning)
-    def full_result(sharpen):
-        result = reconstruct(sharpen, settings.quality_mm)
+    def full_result(sharpen, winding_beta=2.0):
+        result = reconstruct(sharpen, settings.quality_mm, winding_beta=winding_beta,
+                             stage='Уточнение воксельной поверхности' if winding_beta > 2 else None)
         if translation is not None:
             result.transform(mm.AffineXf3f.translation(translation))
         # Validate in output coordinates, once per full candidate. Never try
         # CutAndFill on a failed full-resolution Sharpening reconstruction.
         check = diagnostics(result, mm)
+        if not sharpen and check['topology_valid'] and not check['closed']:
+            from .seams import fill_voxel_seams
+            tracker.update(65, 'Закрытие микротрещин воксельной поверхности')
+            candidate, seam_report = fill_voxel_seams(result, mm, settings.quality_mm*.25)
+            report['reconstruction_seams'] = seam_report
+            if seam_report['accepted']:
+                candidate_info = diagnostics(candidate, mm)
+                if candidate_info['components'] == check['components']:
+                    result, check = candidate, candidate_info
+                else:
+                    seam_report.update(accepted=False, reason='seam_shell_count_changed')
+            emit('Закрытие микротрещин: ' + ('принято.' if seam_report['accepted']
+                 else f"отклонено [{seam_report.get('reason')}]."))
+            del candidate
         if not sharpen and not valid(check):
             result, check = repair_reconstruction_intersections(result, check, mm, settings, tracker, report, emit)
         return result, check
@@ -416,6 +446,26 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
             fallback['elapsed_seconds'] = time.monotonic()-started
             emit(f"Повтор без Sharpening: {fallback['elapsed_seconds']:.2f} с.")
         use_sharp = False
+    if not use_sharp and not valid(check) and check['topology_valid']:
+        threshold = max(settings.local_fix_max_faces, int(check['triangles']*settings.local_fix_fraction))
+        if check['boundary_loops'] <= 200 and check['self_intersecting_faces'] <= threshold:
+            # Near touching surfaces the approximate winding field can change
+            # sign unreliably. Re-evaluate it more accurately, once, on the SAME
+            # grid; do not relax the tolerance or accept a defective surface.
+            retry = report['accurate_winding_retry'] = {
+                'before': check, 'voxel_size_mm': settings.quality_mm, 'winding_beta': 4.0,
+                'attempted': True, 'accepted': False,
+                'previous_seams': report.pop('reconstruction_seams', None),
+                'previous_local_repair': report.pop('reconstruction_local_repair', None)}
+            report['reconstruction_validation'] = check
+            emit('Остались дефекты поверхности: один повтор с более точным winding и тем же шагом.')
+            started = time.monotonic()
+            del result
+            try:
+                result, check = full_result(False, winding_beta=4.0)
+                retry.update(after=check, accepted=valid(check))
+            finally:
+                retry['elapsed_seconds'] = time.monotonic()-started
     sharp['accepted'] = use_sharp
     report['reconstruction_validation'] = check
     return result
@@ -442,9 +492,47 @@ def repair_reconstruction_intersections(mesh, info, mm, settings, tracker, repor
     emit(f"Воксельная поверхность: локальное исправление {info['self_intersecting_faces']} пересекающихся граней.")
     item['attempts'] = []
     try:
+        # First keep connectivity and cap displacement during native relaxation.
+        # The SDK's generic self-intersection fixer can subdivide the patch and
+        # overshoot this budget before a posteriori validation gets a chance.
+        collisions = mm.findSelfCollidingTrianglesBS(mm.MeshPart(mesh))
+        for hops, iterations in ((2, 20), (3, 40)):
+            attempt = {'method': 'bounded_relax', 'region_hops': hops, 'iterations': iterations}
+            item['attempts'].append(attempt)
+            candidate = None
+            try:
+                candidate = mm.Mesh(mesh)
+                region = mm.getIncidentVerts(candidate.topology, collisions)
+                mm.expand(candidate.topology, region, hops)
+                params = mm.MeshRelaxParams()
+                params.region = region
+                params.iterations = iterations
+                params.force = .25
+                params.limitNearInitial = True
+                # Reserve headroom for float32 coordinate rounding; independently
+                # verify actual movement in float64 before accepting the result.
+                params.maxInitialDist = item['tolerance_mm']*.98
+                mm.relax(candidate, params)
+                candidate.invalidateCaches()
+                after = attempt['after'] = diagnostics(candidate, mm)
+                if not valid(after):
+                    attempt['reason'] = 'local_fix_invalid'
+                elif after['components'] != info['components']:
+                    attempt['reason'] = 'local_fix_shell_count_changed'
+                else:
+                    proof = attempt['verification'] = rd.vertex_displacement_bound(
+                        mesh, candidate, item['tolerance_mm'])
+                    if proof['verified']:
+                        item.update(attempt, accepted=True)
+                        return candidate, after
+                    attempt['reason'] = proof.get('reason', 'local_fix_exceeds_tolerance')
+            except (RuntimeError, MemoryError) as exc:
+                attempt.update(reason='local_fix_native_error', detail=str(exc))
+            del candidate
         for method in (mm.FixSelfIntersectionMethod.Relax, mm.FixSelfIntersectionMethod.CutAndFill):
             attempt = {'method': str(method)}
             item['attempts'].append(attempt)
+            candidate = None
             try:
                 candidate = mm.Mesh(mesh)
                 params = mm.FixSelfIntersectionSettings()
@@ -766,12 +854,17 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
     owned = work_dir is None
     folder = create_job(settings.temp_directory) if owned else Path(work_dir).resolve()
     folder.mkdir(parents=True, exist_ok=True)
+    report = {}
+    started = time.monotonic()
     try:
-        report = _run(source, settings, emit, progress, folder)
+        report = _run(source, settings, emit, progress, folder, report)
         if target:
             _publish_cli(report, target)
         return clean_json(report)
-    except BaseException:
+    except BaseException as exc:
+        if isinstance(exc, Exception) and not hasattr(exc, 'report'):
+            report.update(status='error', error=str(exc), elapsed_seconds=time.monotonic()-started)
+            exc.report = clean_json(report)
         if owned:
             remove_job(folder)
         raise
@@ -804,17 +897,21 @@ def _publish_cli(report, target):
         report['warnings'].append('STL сохранён, но не удалось записать JSON-отчёт: '+str(exc))
 
 
-def _run(source, settings, emit, progress, folder):
+def _run(source, settings, emit, progress, folder, report=None):
     from meshlib import mrmeshpy as mm, mrmeshnumpy as mn
     from .orientation import prepare_orientation, finite_vertices
     from .inspection import describe_mesh
     started = time.monotonic()
-    report = {'version': '1.0.0', 'settings': asdict(settings), 'source': str(source),
+    if report is None:
+        report = {}
+    report.update({'version': '1.0.0', 'engine_revision': 'blender-1.1.2',
+              'settings': asdict(settings), 'source': str(source),
               'units': 'mm', 'tolerance_certified': False, 'warnings': [], 'steps': [],
-              'compute_device': 'cpu_native_parallel', 'acceleration': capabilities(settings.disable_cuda)}
+              'compute_device': 'cpu_native_parallel', 'acceleration': capabilities(settings.disable_cuda)})
     report['stage_timings'] = []
     tracker = Progress(progress, emit, report['stage_timings'],
-        lambda stage: report['compute_device'] if stage in {'Проба острых рёбер (шаг ×4)', 'Оценка времени (шаг ×4)', 'Восстановление поверхности'}
+        lambda stage: report['compute_device'] if stage.startswith(
+            ('Проба острых рёбер', 'Оценка времени', 'Восстановление поверхности', 'Уточнение воксельной поверхности'))
         else ','.join(report['acceleration'].get('projection_backends', ['cpu_native_parallel']))
         if stage == 'Карта отклонения от исходника' or stage.startswith('Строгая проверка') else 'cpu_native_parallel')
     emit('compute_device=cpu_native_parallel; CUDA '+('выключена настройкой.' if settings.disable_cuda else 'авто.'))

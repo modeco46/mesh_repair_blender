@@ -228,6 +228,35 @@ def quad_upper_bounds(triangles, quads):
     return result
 
 
+def vertex_displacement_bound(reference, candidate, tolerance):
+    """Bound both complete surfaces when connectivity is unchanged.
+
+    A point and its counterpart use the same barycentric weights. Their distance
+    cannot exceed the largest vertex displacement, including triangle interiors.
+    Native topology equality avoids allocating/sorting millions of face rows.
+    """
+    from meshlib import mrmeshnumpy as mn
+    if reference.topology != candidate.topology:
+        return {'verified': False, 'reason': 'topology_changed'}
+    before, after = mn.getNumpyVerts(reference), mn.getNumpyVerts(candidate)
+    if before.shape != after.shape:
+        return {'verified': False, 'reason': 'vertex_count_changed'}
+    maximum, scale = 0.0, 1.0
+    for start in range(0, len(before), 262_144):
+        a = before[start:start+262_144].astype(np.float64)
+        b = after[start:start+262_144].astype(np.float64)
+        if not np.isfinite(a).all() or not np.isfinite(b).all():
+            return {'verified': False, 'reason': 'non_finite_coordinates'}
+        maximum = max(maximum, float(np.linalg.norm(a-b, axis=1).max(initial=0)))
+        scale = max(scale, float(np.abs(a).max(initial=0)), float(np.abs(b).max(initial=0)))
+    margin = 256*np.finfo(float).eps*scale
+    bound = maximum + margin
+    return {'verified': bound <= tolerance, 'upper_bound_mm': bound, 'tolerance_mm': tolerance,
+            'numeric_margin_mm': margin, 'max_vertex_displacement_mm': maximum,
+            'method': 'unchanged_topology_vertex_displacement',
+            'reference': 'reconstructed_mesh_before_local_fix'}
+
+
 def verify_surface_bound(reference, candidate, tolerance, progress=lambda value: None,
                          max_depth=32, max_checks=None, acceleration=None, emit=lambda message: None):
     """Conservative adaptive bidirectional bound; uncertainty REJECTS simplification.

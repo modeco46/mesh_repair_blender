@@ -9,16 +9,13 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        target: [windows-x64, linux-x64]
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: python scripts/build_release.py --target ${{ matrix.target }}
+      - run: python scripts/build_release.py --target windows-x64
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*.zip

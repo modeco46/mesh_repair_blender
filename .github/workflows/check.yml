@@ -42,7 +42,7 @@ jobs:
         with:
           python-version: "3.13"
       - run: python scripts/build_release.py --target ${{ matrix.target }}
-      - run: python scripts/smoke_release.py dist/mesh-repair-blender-1.1.0-${{ matrix.target }}.zip
+      - run: python scripts/smoke_release.py dist/mesh-repair-blender-1.1.1-${{ matrix.target }}.zip
       - name: Check Blender 5.3 panel, progress and heatmap
         if: runner.os == 'Linux'
         env:
@@ -52,13 +52,13 @@ jobs:
           curl -fL --retry 3 https://download.blender.org/release/Blender5.3/blender-5.3.0-linux-x64.tar.xz -o "$BLENDER_TEST_DIR/blender.tar.xz" || curl -fL --retry 3 https://ftp.halifax.rwth-aachen.de/blender/release/Blender5.3/blender-5.3.0-linux-x64.tar.xz -o "$BLENDER_TEST_DIR/blender.tar.xz"
           echo "dacb8264197a3f7fda6001285a5a506fc97ee943881261c2c3bd63c882f22e05  $BLENDER_TEST_DIR/blender.tar.xz" | sha256sum --check
           tar -xf "$BLENDER_TEST_DIR/blender.tar.xz" -C "$BLENDER_TEST_DIR"
-          unzip -q dist/mesh-repair-blender-1.1.0-linux-x64.zip -d "$BLENDER_TEST_DIR/addon"
+          unzip -q dist/mesh-repair-blender-1.1.1-linux-x64.zip -d "$BLENDER_TEST_DIR/addon"
           export MESH_REPAIR_ADDON_ROOT="$BLENDER_TEST_DIR/addon"
           export MESH_REPAIR_PYTHON="$BLENDER_TEST_DIR/blender-5.3.0-linux-x64/5.3/python/bin/python3.13"
           "$BLENDER_TEST_DIR/blender-5.3.0-linux-x64/blender" --background --factory-startup --python-exit-code 1 --python tests/blender_smoke.py
           "$BLENDER_TEST_DIR/blender-5.3.0-linux-x64/blender" --background --factory-startup --python-exit-code 1 --python tests/blender_ui_smoke.py
       - uses: actions/upload-artifact@v4
         with:
-          name: mesh-repair-blender-1.1.0-${{ matrix.target }}
+          name: mesh-repair-blender-1.1.1-${{ matrix.target }}
           path: dist/*.zip
           retention-days: 30

@@ -76,7 +76,9 @@ def main():
                          "progress_offset": 0, "progress_pending": b"", "process": SimpleNamespace(poll=lambda: None)}
         modal = addon._MeshRepairModal()
         modal._mesh_repair_job_id = "test"
-        modal.modal(fake_context, SimpleNamespace(type="TIMER", timer="test-timer"))
+        # Match Blender's Event API: there is no event.timer attribute.
+        assert "timer" not in bpy.types.Event.bl_rna.properties
+        assert modal.modal(fake_context, SimpleNamespace(type="TIMER")) == {"PASS_THROUGH"}
         assert runtime.progress == 35 and redraws
         addon._ACTIVE = None
     mesh_repair_blender.unregister()

@@ -55,7 +55,8 @@ def main():
         assert job["process"].wait(timeout=60) == 0
         modal = addon._MeshRepairModal()
         modal._mesh_repair_job_id = job["id"]
-        assert modal.modal(context, SimpleNamespace(type="TIMER", timer=job["timer"])) == {"FINISHED"}
+        # A real Blender Event does not expose the originating timer.
+        assert modal.modal(context, SimpleNamespace(type="TIMER")) == {"FINISHED"}
         runtime = context.window_manager.mesh_repair_runtime
         assert not runtime.busy and not runtime.stage.startswith("Ошибка"), runtime.message
     result = runtime.result_object

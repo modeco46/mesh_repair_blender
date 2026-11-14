@@ -372,7 +372,9 @@ class _MeshRepairModal:
         if event.type == "ESC":
             job["cancelled"] = True
             job["process"].terminate()
-        if event.type == "TIMER" and event.timer == job["timer"]:
+        # Blender's Event exposes the type, not the timer that generated it.
+        # Polling on another TIMER is harmless; the job id above owns this modal.
+        if event.type == "TIMER":
             _read_progress(job, _runtime(context))
             _redraw(context)
             if job["process"].poll() is not None:

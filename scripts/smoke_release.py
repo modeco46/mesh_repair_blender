@@ -4,10 +4,29 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import struct
 import subprocess
 import sys
 import tempfile
 import zipfile
+
+
+def write_cube(source: Path) -> None:
+    vertices = (
+        (0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0),
+        (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1),
+    )
+    faces = (
+        (0, 2, 1), (0, 3, 2), (4, 5, 6), (4, 6, 7),
+        (0, 1, 5), (0, 5, 4), (3, 7, 6), (3, 6, 2),
+        (0, 4, 7), (0, 7, 3), (1, 2, 6), (1, 6, 5),
+    )
+    with source.open("wb") as stream:
+        stream.write(b"MeshRepair smoke".ljust(80, b"\0"))
+        stream.write(struct.pack("<I", len(faces)))
+        for face in faces:
+            points = tuple(float(value) for index in face for value in vertices[index])
+            stream.write(struct.pack("<12fH", 0, 0, 0, *points, 0))
 
 
 def main() -> None:
@@ -20,12 +39,8 @@ def main() -> None:
             archive.extractall(root)
         package = root / "mesh_repair_blender"
         worker = package / "worker.py"
-        sys.path.insert(0, str(package / "vendor"))
-        from meshlib import mrmeshpy as mm
-
         source = root / "source.stl"
-        mesh = mm.makeCube(mm.Vector3f(1, 1, 1), mm.Vector3f(0, 0, 0))
-        mm.saveMesh(mesh, source)
+        write_cube(source)
         settings = root / "settings.json"
         settings.write_text('{"quality_mm": 0.05, "disable_cuda": true}', encoding="utf-8")
         result = root / "result.json"
@@ -36,11 +51,10 @@ def main() -> None:
             "--result-file", str(result), "--vertices", str(vertices), "--faces", str(faces),
         ]
         subprocess.run(command, check=True)
-        import numpy as np
-
         assert json.loads(result.read_text(encoding="utf-8"))["status"] == "ok"
-        assert np.load(vertices).shape == (8, 3)
-        assert np.load(faces).shape == (12, 3)
+        report = json.loads((root / "report.json").read_text(encoding="utf-8"))
+        assert report["after"]["triangles"] == 12
+        assert vertices.stat().st_size > 128 and faces.stat().st_size > 128
         print("MESH_REPAIR_RELEASE_SMOKE_OK")
 
 

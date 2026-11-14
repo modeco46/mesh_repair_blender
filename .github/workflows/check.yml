@@ -27,16 +27,21 @@ jobs:
 
   package:
     needs: test
-    runs-on: ubuntu-latest
     strategy:
       matrix:
-        target: [windows-x64, linux-x64]
+        include:
+          - target: windows-x64
+            os: windows-latest
+          - target: linux-x64
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
       - run: python scripts/build_release.py --target ${{ matrix.target }}
+      - run: python scripts/smoke_release.py dist/mesh-repair-blender-1.0.0-${{ matrix.target }}.zip
       - uses: actions/upload-artifact@v4
         with:
           name: mesh-repair-blender-1.0.0-${{ matrix.target }}

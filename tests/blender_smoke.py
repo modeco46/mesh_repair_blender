@@ -11,7 +11,7 @@ import tempfile
 import bpy
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(os.environ.get("MESH_REPAIR_ADDON_ROOT", Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(ROOT))
 
 import mesh_repair_blender  # noqa: E402

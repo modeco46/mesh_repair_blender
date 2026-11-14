@@ -19,6 +19,7 @@ from .bridge import create_mesh_object, write_selected_stl
 
 
 _ACTIVE = None
+_CACHED_JOB_DIR = None
 
 
 class MeshRepairSettings(PropertyGroup):
@@ -68,6 +69,7 @@ class MeshRepairRuntime(PropertyGroup):
     message: StringProperty(default="", options={"SKIP_SAVE"})
     last_log: StringProperty(default="", options={"SKIP_SAVE"})
     report_text: StringProperty(default="", options={"SKIP_SAVE"})
+    deviation_file: StringProperty(default="", options={"SKIP_SAVE"})
     retry_available: BoolProperty(default=False, options={"SKIP_SAVE"})
     has_result: BoolProperty(default=False, options={"SKIP_SAVE"})
     triangles_before: IntProperty(default=0, options={"SKIP_SAVE"})
@@ -191,11 +193,12 @@ def _update_summary(runtime, report, operation):
 
 
 def _finish_job(context, job):
-    global _ACTIVE
+    global _ACTIVE, _CACHED_JOB_DIR
     runtime = _runtime(context)
     _read_progress(job, runtime)
     job["log_stream"].close()
     result = None
+    retain_job = False
     try:
         if job["result_file"].is_file():
             result = json.loads(job["result_file"].read_text(encoding="utf-8"))
@@ -211,6 +214,8 @@ def _finish_job(context, job):
         report = None
         if result.get("report") and Path(result["report"]).is_file():
             report = json.loads(Path(result["report"]).read_text(encoding="utf-8"))
+            report["blender_source_objects"] = job["source_names"]
+            report["blender_mm_per_unit"] = job["mm_per_unit"]
             text = _store_report(job["result_name"], report)
             runtime.report_text = text.name
             _update_summary(runtime, report, job["operation"])
@@ -234,6 +239,13 @@ def _finish_job(context, job):
                     if source is not None:
                         source.hide_set(True)
             runtime.message = f"Создан объект {repaired.name}."
+            map_file = job["core_dir"] / "deviation.npz"
+            if map_file.is_file():
+                if _CACHED_JOB_DIR is not None:
+                    shutil.rmtree(_CACHED_JOB_DIR, ignore_errors=True)
+                _CACHED_JOB_DIR = job["directory"]
+                runtime.deviation_file = str(map_file)
+                retain_job = True
         else:
             runtime.message = "Проверка завершена; геометрия не изменена."
         runtime.progress = 100
@@ -245,7 +257,8 @@ def _finish_job(context, job):
         runtime.busy = False
         if job.get("timer") is not None:
             context.window_manager.event_timer_remove(job["timer"])
-        shutil.rmtree(job["directory"], ignore_errors=True)
+        if not retain_job:
+            shutil.rmtree(job["directory"], ignore_errors=True)
         _ACTIVE = None
 
 
@@ -337,7 +350,7 @@ class _MeshRepairModal:
         return {"PASS_THROUGH"}
 
 
-class MESHREPAIR_OT_repair(_MeshRepairModal, Operator):
+class MESH_REPAIR_OT_repair_selected(_MeshRepairModal, Operator):
     bl_idname = "mesh_repair.repair_selected"
     bl_label = "Исправить выбранное"
     bl_description = "Создать исправленный объект из выбранных mesh-объектов"
@@ -353,7 +366,7 @@ class MESHREPAIR_OT_repair(_MeshRepairModal, Operator):
         return _begin(context, "repair", self, self.force_no_sharp)
 
 
-class MESHREPAIR_OT_check(_MeshRepairModal, Operator):
+class MESH_REPAIR_OT_check_selected(_MeshRepairModal, Operator):
     bl_idname = "mesh_repair.check_selected"
     bl_label = "Проверить"
     bl_description = "Диагностировать выбранные объекты без изменения геометрии"
@@ -366,7 +379,7 @@ class MESHREPAIR_OT_check(_MeshRepairModal, Operator):
         return _begin(context, "check", self)
 
 
-class MESHREPAIR_OT_stop(Operator):
+class MESH_REPAIR_OT_stop(Operator):
     bl_idname = "mesh_repair.stop"
     bl_label = "Остановить"
     bl_description = "Завершить отдельный процесс MeshRepair"
@@ -385,7 +398,7 @@ class MESHREPAIR_OT_stop(Operator):
         return {"FINISHED"}
 
 
-class MESHREPAIR_OT_save_report(Operator, ExportHelper):
+class MESH_REPAIR_OT_save_report(Operator, ExportHelper):
     bl_idname = "mesh_repair.save_report"
     bl_label = "Сохранить JSON-отчёт"
     filename_ext = ".json"
@@ -400,6 +413,27 @@ class MESHREPAIR_OT_save_report(Operator, ExportHelper):
         text = bpy.data.texts.get(_runtime(context).report_text)
         Path(self.filepath).write_text(text.as_string(), encoding="utf-8")
         self.report({"INFO"}, f"Отчёт сохранён: {self.filepath}")
+        return {"FINISHED"}
+
+
+class MESH_REPAIR_OT_save_deviation_map(Operator, ExportHelper):
+    bl_idname = "mesh_repair.save_deviation_map"
+    bl_label = "Сохранить карту отклонений"
+    filename_ext = ".npz"
+    filter_glob: StringProperty(default="*.npz", options={"HIDDEN"})
+
+    @classmethod
+    def poll(cls, context):
+        return Path(_runtime(context).deviation_file).is_file()
+
+    def execute(self, context):
+        source = Path(_runtime(context).deviation_file)
+        destination = Path(self.filepath)
+        if source.resolve() == destination.resolve():
+            self.report({"ERROR"}, "Выберите другой путь для сохранения.")
+            return {"CANCELLED"}
+        shutil.copyfile(source, destination)
+        self.report({"INFO"}, f"Карта сохранена: {destination}")
         return {"FINISHED"}
 
 
@@ -461,15 +495,18 @@ class MESHREPAIR_PT_panel(Panel):
         if runtime.report_text:
             layout.label(text=f"Отчёт в Text: {runtime.report_text}", icon="TEXT")
             layout.operator("mesh_repair.save_report", icon="EXPORT")
+        if runtime.deviation_file and Path(runtime.deviation_file).is_file():
+            layout.operator("mesh_repair.save_deviation_map", icon="EXPORT")
 
 
 _CLASSES = (
     MeshRepairSettings,
     MeshRepairRuntime,
-    MESHREPAIR_OT_repair,
-    MESHREPAIR_OT_check,
-    MESHREPAIR_OT_stop,
-    MESHREPAIR_OT_save_report,
+    MESH_REPAIR_OT_repair_selected,
+    MESH_REPAIR_OT_check_selected,
+    MESH_REPAIR_OT_stop,
+    MESH_REPAIR_OT_save_report,
+    MESH_REPAIR_OT_save_deviation_map,
     MESHREPAIR_PT_panel,
 )
 
@@ -482,7 +519,7 @@ def register():
 
 
 def unregister():
-    global _ACTIVE
+    global _ACTIVE, _CACHED_JOB_DIR
     if _ACTIVE is not None:
         try:
             _ACTIVE["process"].terminate()
@@ -491,6 +528,9 @@ def unregister():
         except Exception:
             pass
         _ACTIVE = None
+    if _CACHED_JOB_DIR is not None:
+        shutil.rmtree(_CACHED_JOB_DIR, ignore_errors=True)
+        _CACHED_JOB_DIR = None
     if hasattr(bpy.types.WindowManager, "mesh_repair_runtime"):
         del bpy.types.WindowManager.mesh_repair_runtime
     if hasattr(bpy.types.Scene, "mesh_repair_settings"):

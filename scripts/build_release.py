@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import zipfile
 
 
@@ -77,7 +78,8 @@ def main() -> int:
     parser.add_argument("--target", choices=sorted(PLATFORMS), required=True)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    output = args.output or ROOT / "dist" / f"mesh-repair-blender-1.0.0-{args.target}.zip"
+    version = tomllib.loads((PACKAGE / "blender_manifest.toml").read_text(encoding="utf-8"))["version"]
+    output = args.output or ROOT / "dist" / f"mesh-repair-blender-{version}-{args.target}.zip"
     with tempfile.TemporaryDirectory(prefix="mesh-repair-build-") as temporary:
         temporary = Path(temporary)
         package = copy_package(temporary / "stage")

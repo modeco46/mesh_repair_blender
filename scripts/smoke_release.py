@@ -55,6 +55,14 @@ def main() -> None:
         report = json.loads((root / "report.json").read_text(encoding="utf-8"))
         assert report["after"]["triangles"] == 12
         assert vertices.stat().st_size > 128 and faces.stat().st_size > 128
+        subprocess.run([
+            sys.executable, str(worker), "heatmap", "--source", str(source), "--settings", str(settings),
+            "--job-dir", str(root / "map-job"), "--progress-file", str(root / "map-progress.jsonl"),
+            "--result-file", str(root / "map-result.json"), "--vertices", str(vertices),
+            "--distances", str(root / "distances.npy"),
+        ], check=True)
+        assert json.loads((root / "map-result.json").read_text(encoding="utf-8"))["status"] == "ok"
+        assert (root / "distances.npy").is_file()
         print("MESH_REPAIR_RELEASE_SMOKE_OK")
 
 

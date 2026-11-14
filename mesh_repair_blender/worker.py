@@ -55,7 +55,7 @@ def main(argv=None) -> int:
     if argv is None and "--" in sys.argv:
         argv = sys.argv[sys.argv.index("--") + 1:]
     parser = argparse.ArgumentParser()
-    parser.add_argument("operation", choices=("check", "repair"))
+    parser.add_argument("operation", choices=("check", "repair", "heatmap"))
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--settings", required=True, type=Path)
     parser.add_argument("--job-dir", required=True, type=Path)
@@ -63,6 +63,7 @@ def main(argv=None) -> int:
     parser.add_argument("--result-file", required=True, type=Path)
     parser.add_argument("--vertices", type=Path)
     parser.add_argument("--faces", type=Path)
+    parser.add_argument("--distances", type=Path)
     args = parser.parse_args(argv)
     args.job_dir.mkdir(parents=True, exist_ok=True)
     channel = Channel(args.progress_file)
@@ -71,7 +72,14 @@ def main(argv=None) -> int:
 
         values = json.loads(args.settings.read_text(encoding="utf-8"))
         settings = Settings(**values)
-        if args.operation == "check":
+        if args.operation == "heatmap":
+            from heatmap_compute import measure
+
+            if args.vertices is None or args.distances is None:
+                raise ValueError("Heatmap array paths are required.")
+            report = measure(args.source, args.vertices, args.distances, settings.disable_cuda,
+                             lambda event: channel.send("progress", event))
+        elif args.operation == "check":
             from core.inspection import inspect_mesh
 
             report = inspect_mesh(args.source, lambda text: channel.send("log", text),

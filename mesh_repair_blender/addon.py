@@ -11,15 +11,17 @@ import tempfile
 import uuid
 
 import bpy
-from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
+from bpy.props import BoolProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 from bpy.types import Operator, Panel, PropertyGroup
 from bpy_extras.io_utils import ExportHelper
 
 from .bridge import create_mesh_object, write_selected_stl
+from . import heatmap
 
 
 _ACTIVE = None
 _CACHED_JOB_DIR = None
+_LAST_REPAIR = None
 
 
 class MeshRepairSettings(PropertyGroup):
@@ -27,34 +29,24 @@ class MeshRepairSettings(PropertyGroup):
         name="Допуск, мм", description="Шаг ремонта и предел упрощения", default=0.02,
         min=0.001, max=0.5, precision=3,
     )
-    unit_mode: EnumProperty(
-        name="Единицы входа",
-        description="Как переводить координаты Blender в миллиметры для MeshRepair",
-        items=(
-            ("MILLIMETERS", "1 BU = 1 мм", "Координаты объекта уже заданы в миллиметрах"),
-            ("SCENE", "Единицы сцены", "Использовать Unit Scale сцены"),
-            ("METERS", "1 BU = 1 м", "Один Blender Unit равен одному метру"),
-        ),
-        default="MILLIMETERS",
-    )
-    collapse_coplanar: BoolProperty(name="Схлопывать плоскости", default=False)
+    collapse_coplanar: BoolProperty(name="Схлопывать плоскости", default=True)
     coplanar_angle_deg: FloatProperty(
         name="Угол плоскостей", description="Допустимый угол для схлопывания, градусы",
         default=1.0, min=0.0, max=45.0,
     )
-    simplify_curved: BoolProperty(name="Упрощать всю поверхность", default=False)
+    simplify_curved: BoolProperty(name="Упрощать всю поверхность", default=True)
     strict_tolerance: BoolProperty(
         name="Строго доказывать допуск", default=False,
         description="Медленная численная верхняя граница для всей поверхности",
     )
     weld_close_vertices: BoolProperty(
-        name="Склеивать близкие вершины", default=False,
+        name="Склеивать близкие вершины", default=True,
         description="Порог склейки равен 0,1 от выбранного допуска",
     )
-    restore_sharp_edges: BoolProperty(name="Восстанавливать острые рёбра", default=True)
-    remove_small_shells: BoolProperty(name="Удалять оболочки < 50 граней", default=False)
+    restore_sharp_edges: BoolProperty(name="Восстанавливать острые рёбра", default=False)
+    remove_small_shells: BoolProperty(name="Удалять оболочки < 50 граней", default=True)
     disable_cuda: BoolProperty(name="Без CUDA", default=False)
-    hide_sources: BoolProperty(name="Скрыть исходники после ремонта", default=False)
+    hide_sources: BoolProperty(name="Скрыть исходники после ремонта", default=True)
     temp_directory: StringProperty(
         name="Временная папка", subtype="DIR_PATH", default="",
         description="Пустое поле использует системную временную папку",
@@ -69,7 +61,8 @@ class MeshRepairRuntime(PropertyGroup):
     message: StringProperty(default="", options={"SKIP_SAVE"})
     last_log: StringProperty(default="", options={"SKIP_SAVE"})
     report_text: StringProperty(default="", options={"SKIP_SAVE"})
-    deviation_file: StringProperty(default="", options={"SKIP_SAVE"})
+    result_object: PointerProperty(type=bpy.types.Object, options={"SKIP_SAVE"})
+    operation: StringProperty(default="", options={"SKIP_SAVE"})
     retry_available: BoolProperty(default=False, options={"SKIP_SAVE"})
     has_result: BoolProperty(default=False, options={"SKIP_SAVE"})
     triangles_before: IntProperty(default=0, options={"SKIP_SAVE"})
@@ -83,6 +76,14 @@ class MeshRepairRuntime(PropertyGroup):
 
 def _runtime(context):
     return context.window_manager.mesh_repair_runtime
+
+
+def _redraw(context):
+    # PropertyGroup writes from a modal timer do not invalidate the N-panel.
+    for window in context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == "VIEW_3D":
+                area.tag_redraw()
 
 
 def _settings_dict(settings, force_no_sharp=False):
@@ -138,6 +139,8 @@ def _command(job, operation):
     ]
     if operation == "repair":
         command += ["--vertices", str(job["vertices"]), "--faces", str(job["faces"])]
+    elif operation == "heatmap":
+        command += ["--vertices", str(job["vertices"]), "--distances", str(job["distances"])]
     return command
 
 
@@ -186,14 +189,13 @@ def _update_summary(runtime, report, operation):
     runtime.intersections = int(after.get("self_intersecting_faces", 0) or 0)
     runtime.warning_count = len(report.get("warnings", []))
     acceleration = report.get("acceleration", {})
-    runtime.backend = str(report.get("compute_device") or
-                          ("CUDA: " + acceleration.get("gpu_name", "GPU")
-                           if acceleration.get("cuda_available") else "CPU native parallel"))
+    devices = [str(report.get("compute_device", "")), *acceleration.get("projection_backends", [])]
+    runtime.backend = "CPU + CUDA" if any("cuda" in value.lower() for value in devices) else "CPU"
     runtime.has_result = True
 
 
 def _finish_job(context, job):
-    global _ACTIVE, _CACHED_JOB_DIR
+    global _ACTIVE, _CACHED_JOB_DIR, _LAST_REPAIR
     runtime = _runtime(context)
     _read_progress(job, runtime)
     job["log_stream"].close()
@@ -211,6 +213,17 @@ def _finish_job(context, job):
             runtime.message = f"Worker завершился с кодом {job['process'].returncode}. См. worker.log."
             return
         status = result.get("status")
+        if job["operation"] == "heatmap":
+            if status != "ok":
+                raise RuntimeError(result.get("message", "Не удалось построить карту."))
+            import numpy as np
+
+            target = job["result_object"]
+            _validate_map_geometry(job)
+            heatmap.attach(target, np.load(job["distances"], allow_pickle=False), job["quality_mm"])
+            heatmap.show(context, target)
+            runtime.progress, runtime.stage = 100, "Карта отклонений"
+            return
         report = None
         if result.get("report") and Path(result["report"]).is_file():
             report = json.loads(Path(result["report"]).read_text(encoding="utf-8"))
@@ -229,23 +242,24 @@ def _finish_job(context, job):
             runtime.message = result.get("message", "Неизвестная ошибка worker.")
             return
         if job["operation"] == "repair":
+            heatmap.hide()
             repaired = create_mesh_object(context, job["vertices"], job["faces"],
                                           job["result_name"], job["mm_per_unit"])
             repaired["mesh_repair_report"] = runtime.report_text
-            repaired["mesh_repair_quality_mm"] = context.scene.mesh_repair_settings.quality_mm
-            if context.scene.mesh_repair_settings.hide_sources:
+            repaired["mesh_repair_quality_mm"] = job["quality_mm"]
+            runtime.result_object = repaired
+            job["result_object"] = repaired
+            _LAST_REPAIR = job
+            if job["hide_sources"]:
                 for name in job["source_names"]:
                     source = bpy.data.objects.get(name)
                     if source is not None:
                         source.hide_set(True)
             runtime.message = f"Создан объект {repaired.name}."
-            map_file = job["core_dir"] / "deviation.npz"
-            if map_file.is_file():
-                if _CACHED_JOB_DIR is not None:
-                    shutil.rmtree(_CACHED_JOB_DIR, ignore_errors=True)
-                _CACHED_JOB_DIR = job["directory"]
-                runtime.deviation_file = str(map_file)
-                retain_job = True
+            if _CACHED_JOB_DIR is not None:
+                shutil.rmtree(_CACHED_JOB_DIR, ignore_errors=True)
+            _CACHED_JOB_DIR = job["directory"]
+            retain_job = True
         else:
             runtime.message = "Проверка завершена; геометрия не изменена."
         runtime.progress = 100
@@ -260,6 +274,7 @@ def _finish_job(context, job):
         if not retain_job:
             shutil.rmtree(job["directory"], ignore_errors=True)
         _ACTIVE = None
+        _redraw(context)
 
 
 def _begin(context, operation, operator, force_no_sharp=False):
@@ -270,12 +285,15 @@ def _begin(context, operation, operator, force_no_sharp=False):
     settings = context.scene.mesh_repair_settings
     runtime = _runtime(context)
     runtime.busy = True
+    runtime.operation = operation
     runtime.progress = 0
     runtime.stage = "Подготовка геометрии"
     runtime.message = ""
     runtime.last_log = ""
     runtime.retry_available = False
-    runtime.has_result = False
+    if operation != "heatmap":
+        runtime.has_result = False
+    _redraw(context)
     try:
         parent = None
         if settings.temp_directory:
@@ -293,15 +311,25 @@ def _begin(context, operation, operator, force_no_sharp=False):
             "result_file": directory / "result.json",
             "vertices": directory / "result-vertices.npy",
             "faces": directory / "result-faces.npy",
+            "distances": directory / "distances.npy",
             "progress_offset": 0,
             "progress_pending": b"",
             "source_names": [obj.name for obj in context.selected_objects if obj.type == "MESH"],
+            "quality_mm": settings.quality_mm,
+            "hide_sources": settings.hide_sources,
         }
         active = context.view_layer.objects.active
         job["result_name"] = ((active.name if active and active.type == "MESH" else "Mesh") + "_repaired")[:63]
-        export = write_selected_stl(context, job["source"], settings.unit_mode)
-        job["mm_per_unit"] = export["mm_per_blender_unit"]
-        job["settings"].write_text(json.dumps(_settings_dict(settings, force_no_sharp), indent=2), encoding="utf-8")
+        if operation == "heatmap":
+            if _LAST_REPAIR is None:
+                raise ValueError("Сначала исправьте модель.")
+            for key in ("source", "settings", "vertices", "result_object", "quality_mm", "mm_per_unit"):
+                job[key] = _LAST_REPAIR[key]
+            _validate_map_geometry(job)
+        else:
+            export = write_selected_stl(context, job["source"], "SCENE")
+            job["mm_per_unit"] = export["mm_per_blender_unit"]
+            job["settings"].write_text(json.dumps(_settings_dict(settings, force_no_sharp), indent=2), encoding="utf-8")
         log_stream = (directory / "worker.log").open("wb")
         job["log_stream"] = log_stream
         environment = os.environ.copy()
@@ -314,6 +342,7 @@ def _begin(context, operation, operator, force_no_sharp=False):
         operator._mesh_repair_job_id = job["id"]
         context.window_manager.modal_handler_add(operator)
         runtime.stage = "Запуск MeshRepair"
+        _redraw(context)
         return {"RUNNING_MODAL"}
     except Exception as exc:
         if "job" in locals():
@@ -329,6 +358,7 @@ def _begin(context, operation, operator, force_no_sharp=False):
         if "directory" in locals():
             shutil.rmtree(directory, ignore_errors=True)
         operator.report({"ERROR"}, str(exc))
+        _redraw(context)
         return {"CANCELLED"}
 
 
@@ -342,8 +372,9 @@ class _MeshRepairModal:
         if event.type == "ESC":
             job["cancelled"] = True
             job["process"].terminate()
-        if event.type == "TIMER":
+        if event.type == "TIMER" and event.timer == job["timer"]:
             _read_progress(job, _runtime(context))
+            _redraw(context)
             if job["process"].poll() is not None:
                 _finish_job(context, job)
                 return {"FINISHED"}
@@ -395,6 +426,7 @@ class MESH_REPAIR_OT_stop(Operator):
             runtime = _runtime(context)
             runtime.stage = "Остановка..."
             runtime.message = "Ожидание завершения процесса."
+            _redraw(context)
         return {"FINISHED"}
 
 
@@ -416,25 +448,81 @@ class MESH_REPAIR_OT_save_report(Operator, ExportHelper):
         return {"FINISHED"}
 
 
-class MESH_REPAIR_OT_save_deviation_map(Operator, ExportHelper):
-    bl_idname = "mesh_repair.save_deviation_map"
-    bl_label = "Сохранить карту отклонений"
-    filename_ext = ".npz"
-    filter_glob: StringProperty(default="*.npz", options={"HIDDEN"})
+def _map_target(context):
+    obj = context.view_layer.objects.active
+    return obj if heatmap.available(obj) else _runtime(context).result_object
+
+
+def _validate_map_geometry(job):
+    import numpy as np
+
+    obj = job["result_object"]
+    reference = np.load(job["vertices"], mmap_mode="r", allow_pickle=False)
+    coordinates = np.empty((len(obj.data.vertices), 3), dtype=np.float32)
+    obj.data.vertices.foreach_get("co", coordinates.ravel())
+    if (obj.mode != "OBJECT" or obj.modifiers or not np.array_equal(np.asarray(obj.matrix_world), np.eye(4))
+            or coordinates.shape != reference.shape
+            or not np.array_equal(coordinates, np.asarray(reference) / float(job["mm_per_unit"]))):
+        raise ValueError("Результат изменён после ремонта. Для точной карты выполните ремонт заново.")
+
+
+class MESH_REPAIR_OT_view_deviation(_MeshRepairModal, Operator):
+    bl_idname = "mesh_repair.view_deviation"
+    bl_label = "Посмотреть отклонения"
+    bl_description = "Расстояния вершин результата до исходной поверхности; синий — 0, зелёный — допуск, красный — 2 допуска"
 
     @classmethod
     def poll(cls, context):
-        return Path(_runtime(context).deviation_file).is_file()
+        obj = _map_target(context)
+        return _ACTIVE is None and (heatmap.available(obj) or (
+            obj is not None and _LAST_REPAIR is not None and obj == _LAST_REPAIR.get("result_object")))
+
+    def invoke(self, context, event):
+        obj = _map_target(context)
+        if heatmap.active(obj):
+            heatmap.hide()
+            _runtime(context).stage = "Готово"
+        elif heatmap.available(obj):
+            heatmap.show(context, obj)
+            _runtime(context).stage = "Карта отклонений"
+        else:
+            return _begin(context, "heatmap", self)
+        _redraw(context)
+        return {"FINISHED"}
+
+
+class MESH_REPAIR_OT_details(Operator):
+    bl_idname = "mesh_repair.details"
+    bl_label = "Подробности"
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_popup(self, width=480)
+
+    def draw(self, context):
+        import textwrap
+
+        for line in textwrap.wrap(_runtime(context).message, width=60):
+            self.layout.label(text=line)
 
     def execute(self, context):
-        source = Path(_runtime(context).deviation_file)
-        destination = Path(self.filepath)
-        if source.resolve() == destination.resolve():
-            self.report({"ERROR"}, "Выберите другой путь для сохранения.")
-            return {"CANCELLED"}
-        shutil.copyfile(source, destination)
-        self.report({"INFO"}, f"Карта сохранена: {destination}")
         return {"FINISHED"}
+
+
+def _stage_label(runtime):
+    if not runtime.busy:
+        return "Ошибка" if runtime.stage.startswith("Ошибка") else runtime.stage
+    if runtime.operation == "heatmap":
+        return "Карта отклонений"
+    return "Проверка…" if runtime.operation == "check" else "Исправление…"
+
+
+def _metric(layout, label, value):
+    row = layout.row(align=True)
+    row.label(text=label)
+    row.alignment = "EXPAND"
+    right = row.row()
+    right.alignment = "RIGHT"
+    right.label(text=str(value))
 
 
 class MESHREPAIR_PT_panel(Panel):
@@ -449,54 +537,68 @@ class MESHREPAIR_PT_panel(Panel):
         settings = context.scene.mesh_repair_settings
         runtime = _runtime(context)
         selected = sum(1 for obj in context.selected_objects if obj.type == "MESH")
-        layout.label(text=f"Выбрано mesh-объектов: {selected}", icon="MESH_DATA")
+        layout.operator_context = "INVOKE_DEFAULT"
+        layout.operator("mesh_repair.check_selected", icon="VIEWZOOM")
+        box = layout.box()
+        _metric(box, "Выбрано", selected)
+        box.label(text=_stage_label(runtime))
         if runtime.busy:
-            layout.prop(runtime, "progress", text=runtime.stage, slider=True)
-            layout.operator("mesh_repair.stop", icon="CANCEL")
-        else:
-            row = layout.row(align=True)
-            row.operator("mesh_repair.check_selected", icon="VIEWZOOM")
-            row.operator("mesh_repair.repair_selected", icon="MOD_REMESH")
-            if runtime.retry_available:
-                retry = layout.operator("mesh_repair.repair_selected", text="Повторить без острых рёбер", icon="FILE_REFRESH")
-                retry.force_no_sharp = True
-        if runtime.message:
-            box = layout.box()
-            box.label(text=runtime.stage)
-            box.label(text=runtime.message[:120], icon="INFO" if runtime.stage != "Ошибка" else "ERROR")
-            if runtime.last_log:
-                box.label(text=runtime.last_log[:120])
+            box.progress(factor=runtime.progress / 100, type="BAR", text=f"{runtime.progress}%")
+            box.operator("mesh_repair.stop", icon="CANCEL")
+        if runtime.has_result:
+            _metric(box, "Грани до", f"{runtime.triangles_before:,}")
+            if runtime.triangles_after != runtime.triangles_before:
+                _metric(box, "Грани после", f"{runtime.triangles_after:,}")
+            _metric(box, "Оболочки", runtime.components)
+            _metric(box, "Дыры", runtime.boundary_loops)
+            _metric(box, "Пересечения", f"{runtime.intersections:,}")
+            _metric(box, "Вычисления", runtime.backend)
+            if runtime.warning_count:
+                _metric(box, "Предупреждения", runtime.warning_count)
+        if runtime.message and (runtime.stage.startswith("Ошибка") or runtime.retry_available):
+            box.operator("mesh_repair.details", icon="INFO")
         column = layout.column()
         column.enabled = not runtime.busy
         column.prop(settings, "quality_mm")
-        column.prop(settings, "unit_mode")
-        column.prop(settings, "restore_sharp_edges")
-        column.prop(settings, "collapse_coplanar")
-        if settings.collapse_coplanar and not settings.simplify_curved:
-            column.prop(settings, "coplanar_angle_deg")
-        column.prop(settings, "simplify_curved")
-        column.prop(settings, "show_advanced", toggle=True)
+        row = column.row()
+        row.scale_y = 1.7
+        row.operator("mesh_repair.repair_selected", icon="MOD_REMESH")
+        if runtime.retry_available:
+            retry = column.operator("mesh_repair.repair_selected", text="Повтор без острых рёбер", icon="FILE_REFRESH")
+            retry.force_no_sharp = True
+        target = _map_target(context)
+        if target is not None:
+            column.operator("mesh_repair.view_deviation", text="Скрыть отклонения" if heatmap.active(target)
+                            else "Посмотреть отклонения", icon="SHADING_RENDERED")
+        if heatmap.active(target) and target is not None:
+            legend = layout.box()
+            quality = target.get("mesh_repair_map_quality_mm", .02)
+            legend.label(text="Результат → исходник")
+            _metric(legend, "Синий", "0 мм")
+            _metric(legend, "Зелёный", f"{quality:g} мм")
+            _metric(legend, "Красный ≥", f"{2 * quality:g} мм")
+            _metric(legend, "Максимум", f"{target.get('mesh_repair_map_max_mm', 0):.4g} мм")
+        layout.prop(settings, "show_advanced", text="Расширенные настройки",
+                    icon="TRIA_DOWN" if settings.show_advanced else "TRIA_RIGHT", emboss=False)
         if settings.show_advanced:
-            advanced = column.box()
+            advanced = layout.box().column()
+            advanced.enabled = not runtime.busy
+            advanced.prop(settings, "restore_sharp_edges")
+            advanced.prop(settings, "collapse_coplanar")
+            if settings.collapse_coplanar and not settings.simplify_curved:
+                advanced.prop(settings, "coplanar_angle_deg")
+            advanced.prop(settings, "simplify_curved")
             advanced.prop(settings, "strict_tolerance")
             advanced.prop(settings, "weld_close_vertices")
             advanced.prop(settings, "remove_small_shells")
             advanced.prop(settings, "disable_cuda")
             advanced.prop(settings, "hide_sources")
-            advanced.prop(settings, "temp_directory")
-        if runtime.has_result:
-            box = layout.box()
-            box.label(text="Последний результат")
-            box.label(text=f"Треугольники: {runtime.triangles_before:,} → {runtime.triangles_after:,}")
-            box.label(text=f"Оболочки: {runtime.components}; дыр: {runtime.boundary_loops}; пересечений: {runtime.intersections}")
-            box.label(text=f"Вычисления: {runtime.backend}")
-            if runtime.warning_count:
-                box.label(text=f"Предупреждений: {runtime.warning_count}", icon="ERROR")
-        if runtime.report_text:
-            layout.label(text=f"Отчёт в Text: {runtime.report_text}", icon="TEXT")
-            layout.operator("mesh_repair.save_report", icon="EXPORT")
-        if runtime.deviation_file and Path(runtime.deviation_file).is_file():
-            layout.operator("mesh_repair.save_deviation_map", icon="EXPORT")
+            advanced.label(text="Временная папка")
+            advanced.prop(settings, "temp_directory", text="")
+            if runtime.report_text:
+                advanced.separator()
+                advanced.label(text="Отчёт", icon="TEXT")
+                advanced.operator("mesh_repair.save_report", text="Сохранить JSON", icon="EXPORT")
 
 
 _CLASSES = (
@@ -506,7 +608,8 @@ _CLASSES = (
     MESH_REPAIR_OT_check_selected,
     MESH_REPAIR_OT_stop,
     MESH_REPAIR_OT_save_report,
-    MESH_REPAIR_OT_save_deviation_map,
+    MESH_REPAIR_OT_view_deviation,
+    MESH_REPAIR_OT_details,
     MESHREPAIR_PT_panel,
 )
 
@@ -519,7 +622,9 @@ def register():
 
 
 def unregister():
-    global _ACTIVE, _CACHED_JOB_DIR
+    global _ACTIVE, _CACHED_JOB_DIR, _LAST_REPAIR
+    heatmap.hide()
+    _LAST_REPAIR = None
     if _ACTIVE is not None:
         try:
             _ACTIVE["process"].terminate()

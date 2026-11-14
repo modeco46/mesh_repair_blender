@@ -31,6 +31,7 @@ class Settings:
     union_max_seconds: float = 240.0
     voxel_warn_seconds: float = 600.0
     voxel_max_cells: float = 6e9  # Warning threshold; streamed grids are not resident in full.
+    accurate_winding_max_seconds: float = 180.0
 
     def validate(self):
         if not math.isfinite(self.quality_mm) or not .001 <= self.quality_mm <= .5:
@@ -47,6 +48,8 @@ class Settings:
             raise ValueError('Некорректный порог предупреждения о времени вокселизации.')
         if not math.isfinite(self.voxel_max_cells) or self.voxel_max_cells <= 0:
             raise ValueError('Некорректный порог предупреждения о размере воксельной сетки.')
+        if not math.isfinite(self.accurate_winding_max_seconds) or self.accurate_winding_max_seconds < 0:
+            raise ValueError('Некорректный предел времени уточнения winding.')
 
 
 class SharpeningRetryRequired(RuntimeError):
@@ -283,7 +286,7 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
         report['warnings'].append(f'CUDA недоступна, используется CPU: {exc}')
     report['voxel_passes'] = []
 
-    def reconstruct(sharpen, step, probe=False, stage=None, span=None, winding_beta=2.0):
+    def reconstruct(sharpen, step, probe=False, stage=None, span=None, winding_beta=2.0, deadline=None):
         nonlocal winding
         params = mm.GeneralOffsetParameters() if sharpen else mm.OffsetParameters()
         params.voxelSize = step
@@ -303,7 +306,9 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
         params.memoryEfficient = True
         narrow_band = streaming and not sharpen and params.fwn is None and mesh.topology.isClosed()
         params.closeHolesInHoleWindingNumber = not narrow_band
-        params.callBack = tracker.callback(start, end, stage+(' (по слоям)' if streaming else ''))
+        callback = tracker.callback(start, end, stage+(' (по слоям)' if streaming else ''))
+        params.callBack = callback if deadline is None else \
+            (lambda value: bool(callback(value)) and time.monotonic() < deadline)
         if sharpen:
             params.mode = mm.GeneralOffsetParametersMode.Sharpening
         operation = mm.generalOffsetMesh if sharpen else mm.mcOffsetMesh if streaming else mm.offsetMesh
@@ -327,6 +332,9 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
                     result = operation(mm.MeshPart(mesh), 0, params)
                 return result
             except RuntimeError as exc:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError('Уточнение winding остановлено по лимиту времени. '
+                                       'Подробности неудачного ремонта сохранены в JSON-отчёте.') from exc
                 if params.fwn is None:
                     raise
                 report['warnings'].append(f'Ошибка CUDA; повтор на CPU с тем же шагом: {exc}')
@@ -391,9 +399,9 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
             warning = f'Sharpening отклонён на грубой пробе: {exc}. Полный расчёт — обычные воксели.'
             report['warnings'].append(warning)
             emit(warning)
-    def full_result(sharpen, winding_beta=2.0):
+    def full_result(sharpen, winding_beta=2.0, deadline=None):
         result = reconstruct(sharpen, settings.quality_mm, winding_beta=winding_beta,
-                             stage='Уточнение воксельной поверхности' if winding_beta > 2 else None)
+                             stage='Уточнение воксельной поверхности' if winding_beta > 2 else None, deadline=deadline)
         if translation is not None:
             result.transform(mm.AffineXf3f.translation(translation))
         # Validate in output coordinates, once per full candidate. Never try
@@ -448,22 +456,29 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
         use_sharp = False
     if not use_sharp and not valid(check) and check['topology_valid']:
         threshold = max(settings.local_fix_max_faces, int(check['triangles']*settings.local_fix_fraction))
-        if check['boundary_loops'] <= 200 and check['self_intersecting_faces'] <= threshold:
+        if (check['boundary_loops'] <= 200 and check['self_intersecting_faces'] <= threshold
+                and settings.accurate_winding_max_seconds > 0):
             # Near touching surfaces the approximate winding field can change
             # sign unreliably. Re-evaluate it more accurately, once, on the SAME
             # grid; do not relax the tolerance or accept a defective surface.
             retry = report['accurate_winding_retry'] = {
                 'before': check, 'voxel_size_mm': settings.quality_mm, 'winding_beta': 4.0,
                 'attempted': True, 'accepted': False,
+                'limit_seconds': settings.accurate_winding_max_seconds,
                 'previous_seams': report.pop('reconstruction_seams', None),
                 'previous_local_repair': report.pop('reconstruction_local_repair', None)}
             report['reconstruction_validation'] = check
-            emit('Остались дефекты поверхности: один повтор с более точным winding и тем же шагом.')
+            emit('Остались дефекты поверхности: один повтор с более точным winding и тем же шагом; '
+                 f'лимит вычисления поля {settings.accurate_winding_max_seconds:g} с.')
             started = time.monotonic()
             del result
             try:
-                result, check = full_result(False, winding_beta=4.0)
+                result, check = full_result(False, winding_beta=4.0,
+                                            deadline=started+settings.accurate_winding_max_seconds)
                 retry.update(after=check, accepted=valid(check))
+            except TimeoutError:
+                retry['reason'] = 'winding_retry_time_limit'
+                raise
             finally:
                 retry['elapsed_seconds'] = time.monotonic()-started
     sharp['accepted'] = use_sharp

@@ -179,3 +179,36 @@ def test_accuracy_retry_is_bounded_and_keeps_requested_voxel_size(monkeypatch, r
     np.testing.assert_allclose(calls, [(.011, 2.), (.011, 4.)])
     assert report['accurate_winding_retry']['accepted'] == retry_succeeds
     assert valid(report['reconstruction_validation']) == retry_succeeds
+
+
+def test_accuracy_retry_cancels_native_work_at_deadline(monkeypatch):
+    clock = [0.]
+    calls = []
+    damaged = creased_sphere()
+    monkeypatch.setattr(engine.time, 'monotonic', lambda: clock[0])
+
+    def reconstruct(part, offset, params):
+        calls.append(params.windingNumberBeta)
+        if params.windingNumberBeta > 2:
+            clock[0] = 181.
+            assert not params.callBack(.5)
+            raise RuntimeError('Operation canceled')
+        return mm.Mesh(damaged)
+
+    monkeypatch.setattr(mm, 'offsetMesh', reconstruct)
+    monkeypatch.setattr(engine, 'repair_reconstruction_intersections', lambda mesh, info, *a: (mesh, info))
+    report = {'warnings': []}
+    with pytest.raises(TimeoutError, match='лимиту времени'):
+        engine.sparse_repair(mm.makeCube(mm.Vector3f(.1, .1, .1)), mm,
+            Settings(.011, restore_sharp_edges=False, disable_cuda=True), Progress(lambda _: None),
+            report, lambda _: None)
+    assert calls == [2., 4.]
+    assert report['accurate_winding_retry']['reason'] == 'winding_retry_time_limit'
+    assert not report['accurate_winding_retry']['accepted']
+    assert report['reconstruction_validation']['self_intersecting_faces'] == 4
+
+
+@pytest.mark.parametrize('limit', [-1, float('nan'), float('inf')])
+def test_retry_time_limit_must_be_finite_and_nonnegative(limit):
+    with pytest.raises(ValueError):
+        Settings(accurate_winding_max_seconds=limit).validate()

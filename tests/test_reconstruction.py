@@ -113,13 +113,14 @@ def test_failed_correction_retains_invalid_mesh_and_diagnostics(monkeypatch):
     before = diagnostics(mesh, mm)
     # Simulate a native fix that leaves all intersections in place.
     monkeypatch.setattr(mm, 'relax', lambda *a: True)
+    monkeypatch.setattr(mm, 'fixMeshDegeneracies', lambda *a: None)
     monkeypatch.setattr(mm.SelfIntersections, 'fix', lambda *a: None)
     report = {}
     result, after = engine.repair_reconstruction_intersections(mesh, before, mm, Settings(.011),
         Progress(lambda _: None), report, lambda _: None)
     assert result is mesh and after is before
     assert not report['reconstruction_local_repair']['accepted']
-    assert len(report['reconstruction_local_repair']['attempts']) == 4
+    assert len(report['reconstruction_local_repair']['attempts']) == 8
 
 
 def test_repair_exception_carries_partial_report(tmp_path, monkeypatch):
@@ -175,7 +176,8 @@ def test_accuracy_retry_is_bounded_and_keeps_requested_voxel_size(monkeypatch, r
     monkeypatch.setattr(engine, 'repair_reconstruction_intersections', lambda mesh, info, *a: (mesh, info))
     report = {'warnings': []}
     engine.sparse_repair(mm.makeCube(mm.Vector3f(.1, .1, .1)), mm,
-        Settings(.011, restore_sharp_edges=False, disable_cuda=True), Progress(lambda _: None), report, lambda _: None)
+        Settings(.011, restore_sharp_edges=False, disable_cuda=True, accurate_winding_max_seconds=180),
+        Progress(lambda _: None), report, lambda _: None)
     np.testing.assert_allclose(calls, [(.011, 2.), (.011, 4.)])
     assert report['accurate_winding_retry']['accepted'] == retry_succeeds
     assert valid(report['reconstruction_validation']) == retry_succeeds
@@ -200,7 +202,8 @@ def test_accuracy_retry_cancels_native_work_at_deadline(monkeypatch):
     report = {'warnings': []}
     with pytest.raises(TimeoutError, match='лимиту времени'):
         engine.sparse_repair(mm.makeCube(mm.Vector3f(.1, .1, .1)), mm,
-            Settings(.011, restore_sharp_edges=False, disable_cuda=True), Progress(lambda _: None),
+            Settings(.011, restore_sharp_edges=False, disable_cuda=True, accurate_winding_max_seconds=180),
+            Progress(lambda _: None),
             report, lambda _: None)
     assert calls == [2., 4.]
     assert report['accurate_winding_retry']['reason'] == 'winding_retry_time_limit'
@@ -212,3 +215,87 @@ def test_accuracy_retry_cancels_native_work_at_deadline(monkeypatch):
 def test_retry_time_limit_must_be_finite_and_nonnegative(limit):
     with pytest.raises(ValueError):
         Settings(accurate_winding_max_seconds=limit).validate()
+
+
+def test_failed_local_repair_does_not_restart_the_full_grid_by_default(monkeypatch):
+    damaged = creased_sphere()
+    calls = []
+    monkeypatch.setattr(mm, 'offsetMesh', lambda *a: calls.append(True) or mm.Mesh(damaged))
+    monkeypatch.setattr(engine, 'repair_reconstruction_intersections', lambda mesh, info, *a: (mesh, info))
+    report = {'warnings': []}
+    engine.sparse_repair(mm.makeCube(mm.Vector3f(.1, .1, .1)), mm,
+        Settings(.015, restore_sharp_edges=False, disable_cuda=True), Progress(lambda _: None), report, lambda _: None)
+    assert len(calls) == 1
+    assert not valid(report['reconstruction_validation'])
+
+
+def test_partial_improvements_are_retained_until_the_last_collision_is_fixed():
+    base = mm.makeUVSphere(.08, 24, 24)
+    faces, original = mn.getNumpyFaces(base.topology), mn.getNumpyVerts(base)
+    rng = np.random.default_rng(7)
+    for _ in range(3):
+        vertices = original.copy()
+        indices = rng.choice(len(vertices), 3, replace=False)
+        vertices[indices] += rng.normal(0, .007, size=(3, 3))
+    mesh = mn.meshFromFacesVerts(faces, vertices)
+    report = {'acceleration': {'cuda_disabled': True}}
+    before = diagnostics(mesh, mm)
+    result, after = engine.repair_reconstruction_intersections(mesh, before, mm, Settings(.011),
+        Progress(lambda _: None), report, lambda _: None)
+    item = report['reconstruction_local_repair']
+    retained = [a for a in item['attempts'] if a.get('retained')]
+    assert len(retained) >= 2 and valid(after)
+    assert retained[0]['after']['self_intersecting_faces'] > 0
+    for attempt in retained:
+        assert attempt['after']['self_intersecting_faces'] < attempt['input_intersecting_faces']
+        assert attempt['verification']['verified']
+        assert attempt['verification']['upper_bound_mm'] <= .011*.5
+    assert item['verification']['unchanged_faces_skipped'] > 0
+    # Independent full-surface check of the final patch proof on this fixture.
+    assert reduction.verify_surface_bound(mesh, result, .011*.5,
+                                          acceleration={'cuda_disabled': True})['verified']
+
+
+def test_local_bound_includes_every_face_incident_to_a_moved_vertex():
+    source = mm.makeUVSphere(1, 24, 24)
+    candidate = mm.Mesh(source)
+    candidate.points[mm.VertId(100)] += mm.Vector3f(.0001, 0, 0)
+    candidate.invalidateCaches()
+    proof = reduction.verify_local_surface_bound(source, candidate, .001,
+                                                 acceleration={'cuda_disabled': True})
+    assert proof['verified'] and proof['upper_bound_mm'] <= .001
+    assert 0 < proof['patch_faces'][0] < source.topology.numValidFaces()
+    assert proof['unchanged_faces_skipped'] > 0
+
+
+def test_artifacts_are_removed_before_they_can_block_outer_surface_repair():
+    mesh = mm.makeUVSphere(2, 24, 24)
+    for offset in (0, .25):
+        cavity = mm.makeCube(mm.Vector3f(.5, .5, .5), mm.Vector3f(offset, offset*.7, offset*.4))
+        cavity.topology.flipOrientation()
+        mesh.addMesh(cavity)
+    # A legitimate positive tiny body stays when small-shell removal is off.
+    mesh.addMesh(mm.makeCube(mm.Vector3f(.01, .01, .01), mm.Vector3f(4, 0, 0)))
+    before = diagnostics(mesh, mm)
+    assert before['self_intersecting_faces'] > 0
+    report = {}
+    result, after = engine.clean_reconstruction_artifacts(mesh, before, mm, Settings(.015), report, lambda _: None)
+    assert valid(after) and after['components'] == 2
+    assert report['reconstruction_artifacts']['accepted']
+    assert len(report['reconstruction_artifacts']['removed']) == 2
+    assert diagnostics(mesh, mm)['components'] == 4
+    assert result is not mesh
+
+
+def test_artifact_cleanup_does_not_assume_remaining_mesh_has_no_intersections():
+    mesh = mm.makeUVSphere(1, 24, 24)
+    other = mm.makeUVSphere(1, 24, 24)
+    other.transform(mm.AffineXf3f.translation(mm.Vector3f(1, 0, 0)))
+    mesh.addMesh(other)
+    tiny = mm.makeCube(mm.Vector3f(.01, .01, .01), mm.Vector3f(4, 0, 0))
+    mesh.addMesh(tiny)
+    report = {}
+    _, after = engine.clean_reconstruction_artifacts(mesh, diagnostics(mesh, mm), mm,
+        Settings(.015, remove_small_shells=True), report, lambda _: None)
+    assert after['self_intersecting_faces'] > 0 and not valid(after)
+    assert after['components'] == 2

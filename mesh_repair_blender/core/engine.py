@@ -1,5 +1,5 @@
 """One-click repair. MeshLib owns the native, multithreaded geometry work."""
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 import json
 import math
@@ -31,7 +31,8 @@ class Settings:
     union_max_seconds: float = 240.0
     voxel_warn_seconds: float = 600.0
     voxel_max_cells: float = 6e9  # Warning threshold; streamed grids are not resident in full.
-    accurate_winding_max_seconds: float = 180.0
+    # Full-field retries are opt-in: CUDA kernels may not call back for minutes.
+    accurate_winding_max_seconds: float = 0.0
 
     def validate(self):
         if not math.isfinite(self.quality_mm) or not .001 <= self.quality_mm <= .5:
@@ -245,6 +246,40 @@ def drop_cavities(mesh, after, mm, report, emit, quality_mm):
     return cleaned, dict(topology_info(cleaned, mm), self_intersecting_faces=0), mesh
 
 
+def clean_reconstruction_artifacts(mesh, info, mm, settings, report, emit):
+    """Apply the existing cavity/small-shell policy before repairing collisions.
+
+    Otherwise a tiny interior fragment scheduled for deletion can block a valid
+    outer surface or force a full-grid retry. Re-diagnose the remaining mesh;
+    deleting components never implies that its intersections disappeared.
+    """
+    if not info['closed'] or not info['topology_valid'] or info['components'] < 2:
+        return mesh, info
+    started = time.monotonic()
+    regions = mm.MeshComponents.getAllComponents(mm.MeshPart(mesh))
+    drop = mm.FaceBitSet()
+    removed = []
+    negligible = 1e-3*settings.quality_mm**3
+    for region in regions:
+        count, volume = region.count(), float(mesh.volume(region))
+        cavity = volume <= negligible
+        if cavity or (settings.remove_small_shells and count < 50):
+            drop |= region
+            removed.append({'triangles': count, 'volume_mm3': volume,
+                            'reason': 'cavity_or_zero_thickness' if cavity else 'small_shell'})
+    item = report['reconstruction_artifacts'] = {'before': info, 'accepted': False, 'removed': []}
+    if 0 < drop.count() < info['triangles']:
+        candidate = mesh.cloneRegion(mesh.topology.getValidFaces()-drop)
+        after = diagnostics(candidate, mm)
+        if after['closed'] and after['topology_valid'] and after['triangles']:
+            item.update(accepted=True, removed=removed, after=after)
+            emit(f"Воксельные полости/мелкие оболочки: удалено {len(removed)}; "
+                 f"пересекающихся граней {info['self_intersecting_faces']} → {after['self_intersecting_faces']}.")
+            mesh, info = candidate, after
+    item['elapsed_seconds'] = time.monotonic()-started
+    return mesh, info
+
+
 def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
     """Validate the full result and reuse winding data for a bounded retry."""
     from .orientation import orient_closed_components
@@ -407,6 +442,8 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
         # Validate in output coordinates, once per full candidate. Never try
         # CutAndFill on a failed full-resolution Sharpening reconstruction.
         check = diagnostics(result, mm)
+        if not sharpen and not valid(check):
+            result, check = clean_reconstruction_artifacts(result, check, mm, settings, report, emit)
         if not sharpen and check['topology_valid'] and not check['closed']:
             from .seams import fill_voxel_seams
             tracker.update(65, 'Закрытие микротрещин воксельной поверхности')
@@ -487,17 +524,12 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
 
 
 def repair_reconstruction_intersections(mesh, info, mm, settings, tracker, report, emit):
-    """Repair a few plain-mesher collisions, with rollback and a surface bound.
-
-    This is deliberately separate from input repair: a reconstructed shell may
-    neither disappear nor move outside the small local correction budget.
-    Full Sharpening output never enters this path.
-    """
+    """Keep bounded partial improvements and work on remaining collisions only."""
     from . import reduction as rd
     threshold = max(settings.local_fix_max_faces, int(info['triangles']*settings.local_fix_fraction))
     item = report['reconstruction_local_repair'] = {
         'attempted': False, 'accepted': False, 'before': info, 'threshold_faces': threshold,
-        'tolerance_mm': settings.quality_mm*.25}
+        'tolerance_mm': settings.quality_mm*.25, 'maximum_tolerance_mm': settings.quality_mm*.5}
     if not (info['closed'] and info['topology_valid'] and 0 < info['self_intersecting_faces'] <= threshold):
         item['reason'] = 'outside_local_repair_limits'
         return mesh, info
@@ -506,85 +538,99 @@ def repair_reconstruction_intersections(mesh, info, mm, settings, tracker, repor
     tracker.update(65, 'Локальное исправление воксельной поверхности')
     emit(f"Воксельная поверхность: локальное исправление {info['self_intersecting_faces']} пересекающихся граней.")
     item['attempts'] = []
+    best, best_info = mesh, info
+    best_collisions = mm.findSelfCollidingTrianglesBS(mm.MeshPart(mesh))
+
+    def assess(candidate, attempt):
+        nonlocal best, best_info, best_collisions
+        candidate.invalidateCaches()
+        collisions = mm.findSelfCollidingTrianglesBS(mm.MeshPart(candidate))
+        after = attempt['after'] = dict(topology_info(candidate, mm), self_intersecting_faces=collisions.count())
+        if not after['closed'] or not after['topology_valid'] or not after['triangles']:
+            attempt['reason'] = 'local_fix_invalid'
+        elif after['components'] != info['components']:
+            attempt['reason'] = 'local_fix_shell_count_changed'
+        elif after['self_intersecting_faces'] >= best_info['self_intersecting_faces']:
+            attempt['reason'] = 'no_local_improvement'
+        else:
+            if mesh.topology == candidate.topology:
+                proof = rd.vertex_displacement_bound(mesh, candidate, attempt['tolerance_mm'])
+            else:
+                proof = rd.verify_local_surface_bound(mesh, candidate, attempt['tolerance_mm'],
+                    tracker.callback(65, 66, 'Проверка локального исправления'),
+                    acceleration=report.get('acceleration'), emit=emit)
+            attempt['verification'] = proof
+            if proof.get('verified'):
+                best, best_info, best_collisions = candidate, after, collisions
+                attempt['retained'] = True
+                item['best_remaining_faces'] = after['self_intersecting_faces']
+                emit(f"Локальное исправление: осталось пересекающихся граней {collisions.count()}.")
+                if valid(after):
+                    item.update(attempt, accepted=True)
+                    return True
+            else:
+                attempt['reason'] = proof.get('reason', 'local_fix_exceeds_tolerance')
+        return False
+
     try:
-        # First keep connectivity and cap displacement during native relaxation.
-        # The SDK's generic self-intersection fixer can subdivide the patch and
-        # overshoot this budget before a posteriori validation gets a chance.
-        collisions = mm.findSelfCollidingTrianglesBS(mm.MeshPart(mesh))
-        for hops, iterations in ((2, 20), (3, 40)):
-            attempt = {'method': 'bounded_relax', 'region_hops': hops, 'iterations': iterations}
+        # No pack() between local edits: stable face ids permit a patch proof.
+        # Every attempt is bounded against the original reconstruction, so the
+        # per-pass error budget cannot accumulate along retained candidates.
+        methods = [('bounded_relax', 2, 20, .25), ('bounded_relax', 3, 40, .25),
+                   ('local_degeneracies', 1, 0, .25), ('bounded_relax', 1, 80, .25),
+                   ('native_relax', 0, 0, .25), ('cut_and_fill', 0, 0, .25),
+                   ('bounded_relax', 2, 80, .5), ('cut_and_fill', 0, 0, .5)]
+        for method, hops, iterations, fraction in methods:
+            # Only a few residual faces may use the larger, still sub-voxel,
+            # correction budget. It is always checked against the same origin.
+            if fraction > .25 and best_info['self_intersecting_faces'] > 64:
+                continue
+            budget = settings.quality_mm*fraction
+            attempt = {'method': method, 'input_intersecting_faces': best_info['self_intersecting_faces'],
+                       'tolerance_mm': budget}
             item['attempts'].append(attempt)
             candidate = None
             try:
-                candidate = mm.Mesh(mesh)
-                region = mm.getIncidentVerts(candidate.topology, collisions)
-                mm.expand(candidate.topology, region, hops)
-                params = mm.MeshRelaxParams()
-                params.region = region
-                params.iterations = iterations
-                params.force = .25
-                params.limitNearInitial = True
-                # Reserve headroom for float32 coordinate rounding; independently
-                # verify actual movement in float64 before accepting the result.
-                params.maxInitialDist = item['tolerance_mm']*.98
-                mm.relax(candidate, params)
-                candidate.invalidateCaches()
-                after = attempt['after'] = diagnostics(candidate, mm)
-                if not valid(after):
-                    attempt['reason'] = 'local_fix_invalid'
-                elif after['components'] != info['components']:
-                    attempt['reason'] = 'local_fix_shell_count_changed'
+                candidate = mm.Mesh(best)
+                if method == 'bounded_relax':
+                    attempt.update(region_hops=hops, iterations=iterations)
+                    region = mm.getIncidentVerts(candidate.topology, best_collisions)
+                    mm.expand(candidate.topology, region, hops)
+                    params = mm.MeshRelaxParams()
+                    params.region, params.iterations, params.force = region, iterations, .25
+                    params.limitNearInitial = True
+                    params.maxInitialDist = budget*.98
+                    mm.relax(candidate, params)
+                    if mesh.topology == candidate.topology:
+                        rd.clamp_displacements(mesh, candidate, budget*.98, mm)
+                elif method == 'local_degeneracies':
+                    region = mm.FaceBitSet(best_collisions)
+                    mm.expand(candidate.topology, region, hops)
+                    params = mm.FixMeshDegeneraciesParams()
+                    params.region = region
+                    params.mode = mm.FixMeshDegeneraciesParams.Mode.Decimate
+                    params.maxDeviation = budget*.1
+                    params.tinyEdgeLength = settings.quality_mm*.001
+                    params.maxAngleChange = -1
+                    mm.fixMeshDegeneracies(candidate, params)
                 else:
-                    proof = attempt['verification'] = rd.vertex_displacement_bound(
-                        mesh, candidate, item['tolerance_mm'])
-                    if proof['verified']:
-                        item.update(attempt, accepted=True)
-                        return candidate, after
-                    attempt['reason'] = proof.get('reason', 'local_fix_exceeds_tolerance')
+                    params = mm.FixSelfIntersectionSettings()
+                    params.method = (mm.FixSelfIntersectionMethod.Relax if method == 'native_relax'
+                                     else mm.FixSelfIntersectionMethod.CutAndFill)
+                    params.mimicPatch = True
+                    params.touchIsIntersection = False
+                    mm.SelfIntersections.fix(candidate, params)
+                if assess(candidate, attempt):
+                    return best, best_info
             except (RuntimeError, MemoryError) as exc:
                 attempt.update(reason='local_fix_native_error', detail=str(exc))
             del candidate
-        for method in (mm.FixSelfIntersectionMethod.Relax, mm.FixSelfIntersectionMethod.CutAndFill):
-            attempt = {'method': str(method)}
-            item['attempts'].append(attempt)
-            candidate = None
-            try:
-                candidate = mm.Mesh(mesh)
-                params = mm.FixSelfIntersectionSettings()
-                params.method = method
-                params.mimicPatch = True
-                # Match diagnostics. The SDK's touch=True prepass remeshes
-                # degeneracies across the ENTIRE mesh and can delete unrelated
-                # tiny shells before it reaches the actual intersection patch.
-                params.touchIsIntersection = False
-                mm.SelfIntersections.fix(candidate, params)
-                candidate.pack()
-                after = attempt['after'] = diagnostics(candidate, mm)
-                if not valid(after):
-                    attempt['reason'] = 'local_fix_invalid'
-                elif after['components'] != info['components']:
-                    attempt['reason'] = 'local_fix_shell_count_changed'
-                else:
-                    deviation = attempt['measured_deviation_mm'] = rd.measured_distance(mesh, candidate, mm)
-                    if not math.isfinite(deviation) or deviation > item['tolerance_mm']:
-                        attempt['reason'] = 'local_fix_exceeds_tolerance'
-                    else:
-                        proof = attempt['verification'] = rd.verify_surface_bound(mesh, candidate, item['tolerance_mm'],
-                            tracker.callback(65, 66, 'Проверка локального исправления'),
-                            acceleration=report.get('acceleration'), emit=emit)
-                        proof['reference'] = 'reconstructed_mesh_before_local_fix'
-                        if proof.get('verified'):
-                            item.update(attempt, accepted=True)
-                            return candidate, after
-                        attempt['reason'] = proof.get('reason', 'distance_not_confirmed')
-            except (RuntimeError, MemoryError) as exc:
-                attempt.update(reason='local_fix_native_error', detail=str(exc))
-        item.update(item['attempts'][-1])
+        item.update(after=best_info, partial_improvement=best is not mesh, reason='remaining_local_intersections')
     finally:
         item['elapsed_seconds'] = time.monotonic()-started
         emit(f"Локальное исправление воксельной поверхности: {'принято' if item['accepted'] else 'отклонено'}; "
              f"{item['elapsed_seconds']:.2f} с" + (f" [{item['reason']}]" if item.get('reason') else '.'))
-    return mesh, info
+    return best, best_info
 
 
 def local_repair(mesh, info, mm, settings, tracker, report, emit):
@@ -850,6 +896,60 @@ def simplify_attempts(exported, tmp, mm, settings, tracker, report, emit, workdi
     return accepted
 
 
+def finish_planar_faces(reference, current, mm, settings, tracker, report, emit):
+    """Remove planar partition seams, without renewing the total error budget."""
+    from . import reduction as rd
+    before = report['after']
+    item = report['planar_finish'] = {'requested': True, 'accepted': False,
+                                     'before': before['triangles'], 'after': before['triangles']}
+    started = time.monotonic()
+    tracker.update(94, 'Финальное схлопывание плоских участков')
+    try:
+        # Existing vertices and ridge corners stay fixed. A single unpartitioned
+        # pass removes the artificial seams left by parallel general decimation.
+        planar = replace(settings, simplify_curved=False, collapse_coplanar=True)
+        # A simplified whole body can have <50 faces. The general reducer's
+        # small-shell exclusion must not disable its planar finishing pass.
+        prepared = {'candidate': current, 'protected': None, 'protected_count': 0}
+        candidate, stages = rd.propose_reduction(current, mm, planar, tracker, error_scale=.001, prepared=prepared)
+        item['stages'] = stages
+        if candidate.topology.numValidFaces() >= before['triangles']:
+            item['reason'] = 'no_reducible_edges'
+            return current
+        after = item['candidate'] = diagnostics(candidate, mm)
+        if not valid(after) or after['components'] != before['components']:
+            item['reason'] = 'planar_finish_topology_changed'
+            return current
+        # Always compare to the original repaired surface, not the preceding
+        # simplified mesh. No independent second tolerance can accumulate.
+        measured = rd.measured_distance(reference, candidate, mm)
+        proof = item['verification'] = {'verified': False, 'mode': 'measured_not_proven',
+            'max_deviation_mm': measured, 'reference': 'repaired_mesh_before_simplification',
+            'method': 'bidirectional_vertices_to_surface'}
+        if not math.isfinite(measured) or measured > settings.quality_mm*.95:
+            item['reason'] = 'planar_finish_exceeds_total_tolerance'
+            return current
+        if settings.strict_tolerance:
+            proof = item['verification'] = rd.verify_surface_bound(reference, candidate, settings.quality_mm,
+                tracker.callback(94, 96, 'Строгая проверка финальных плоскостей'),
+                acceleration=report.get('acceleration'), emit=emit)
+            if not proof.get('verified'):
+                item['reason'] = proof.get('reason', 'planar_finish_bound_unconfirmed')
+                return current
+        item.update(accepted=True, after=after['triangles'])
+        report['after'] = after
+        return candidate
+    except (RuntimeError, MemoryError) as exc:
+        item.update(reason='planar_finish_native_error', detail=str(exc))
+        return current
+    finally:
+        item['elapsed_seconds'] = time.monotonic()-started
+        report['steps'].append({'name': 'Финальное схлопывание плоских участков',
+                               'elapsed_seconds': item['elapsed_seconds'], 'accepted': item['accepted']})
+        emit(f"Финальные плоскости: {item['before']:,} → {item['after']:,} треугольников; "
+             f"{item['elapsed_seconds']:.2f} с." + (f" [{item['reason']}]" if item.get('reason') else ''))
+
+
 
 def run(source, destination=None, settings=Settings(), emit=lambda message: None,
         progress=lambda event: None, work_dir=None):
@@ -919,7 +1019,7 @@ def _run(source, settings, emit, progress, folder, report=None):
     started = time.monotonic()
     if report is None:
         report = {}
-    report.update({'version': '1.0.0', 'engine_revision': 'blender-1.1.2',
+    report.update({'version': '1.0.0', 'engine_revision': 'blender-1.1.3',
               'settings': asdict(settings), 'source': str(source),
               'units': 'mm', 'tolerance_certified': False, 'warnings': [], 'steps': [],
               'compute_device': 'cpu_native_parallel', 'acceleration': capabilities(settings.disable_cuda)})
@@ -1093,6 +1193,11 @@ def _run(source, settings, emit, progress, folder, report=None):
             final = cleanup_exported(repaired, None, mm, settings, tracker, report, folder, emit)
             if final is not repaired:
                 fallbacks.append((repaired, after, 'cleanup'))
+    if settings.collapse_coplanar:
+        before_planar, before_planar_info = final, report['after']
+        final = finish_planar_faces(repaired, final, mm, settings, tracker, report, emit)
+        if final is not before_planar:
+            fallbacks.append((before_planar, before_planar_info, 'planar_finish'))
     t = time.monotonic()
     roundtrips = []
     while True:
@@ -1131,6 +1236,9 @@ def _run(source, settings, emit, progress, folder, report=None):
             report['removed_cavities'] = []
         elif stage == 'cleanup':
             report['degenerate_cleanup'].update(accepted=False, reason='export_validation_failed')
+        elif stage == 'planar_finish':
+            report['planar_finish'].update(accepted=False, after=restored['triangles'],
+                                          reason='export_validation_failed')
     report['after'] = final_info
     report['final_roundtrips'] = len(roundtrips)
     report['steps'].append({'name': 'Запись и повторная проверка итогового STL', 'elapsed_seconds': time.monotonic()-t})

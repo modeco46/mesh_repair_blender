@@ -257,6 +257,68 @@ def vertex_displacement_bound(reference, candidate, tolerance):
             'reference': 'reconstructed_mesh_before_local_fix'}
 
 
+def clamp_displacements(reference, candidate, tolerance, mm):
+    """Project cumulative relaxation back to the original vertex budget."""
+    from meshlib import mrmeshnumpy as mn
+    if reference.topology != candidate.topology:
+        return False
+    original, moved = mn.getNumpyVerts(reference), mn.getNumpyVerts(candidate)
+    if original.shape != moved.shape or not np.isfinite(moved).all():
+        return False
+    for start in range(0, len(original), 262_144):
+        initial = original[start:start+262_144].astype(np.float64)
+        block = moved[start:start+262_144].astype(np.float64)
+        delta = block-initial
+        length = np.linalg.norm(delta, axis=1)
+        outside = length > tolerance
+        block[outside] = initial[outside] + delta[outside]*(tolerance/length[outside, None])
+        moved[start:start+262_144] = block
+    candidate.points = mm.VertCoords(mn.fromNumpyArray(moved))
+    candidate.invalidateCaches()
+    return True
+
+
+def verify_local_surface_bound(reference, candidate, tolerance, progress=lambda value: None,
+                               acceleration=None, emit=lambda message: None, max_patch_faces=250_000):
+    """Prove only changed patches; exactly identical faces have distance zero.
+
+    Native local edits preserve vertex/face ids until pack(). Detect moved
+    vertices and changed connectivity in bulk, including every incident face.
+    Both changed patches must bound each other, so no sampled acceptance or
+    assumption about an unchanged neighbourhood is needed.
+    """
+    from meshlib import mrmeshnumpy as mn
+    before_v, after_v = mn.getNumpyVerts(reference), mn.getNumpyVerts(candidate)
+    before_f, after_f = mn.getNumpyFaces(reference.topology), mn.getNumpyFaces(candidate.topology)
+    changed_v = np.ones(max(len(before_v), len(after_v)), dtype=bool)
+    shared = min(len(before_v), len(after_v))
+    changed_v[:shared] = np.any(before_v[:shared] != after_v[:shared], axis=1)
+    old_valid = mn.getNumpyBitSet(reference.topology.getValidFaces())[:len(before_f)]
+    new_valid = mn.getNumpyBitSet(candidate.topology.getValidFaces())[:len(after_f)]
+    old_changed, new_changed = old_valid.copy(), new_valid.copy()
+    shared_faces = min(len(before_f), len(after_f))
+    for start in range(0, shared_faces, 262_144):
+        stop = min(shared_faces, start+262_144)
+        a, b = before_f[start:stop], after_f[start:stop]
+        same = (old_valid[start:stop] & new_valid[start:stop] & np.all(a == b, axis=1)
+                & ~np.any(changed_v[a], axis=1))
+        old_changed[start:stop] &= ~same
+        new_changed[start:stop] &= ~same
+    counts = (int(old_changed.sum()), int(new_changed.sum()))
+    if counts == (0, 0):
+        return {'verified': True, 'upper_bound_mm': 0., 'method': 'unchanged_surface'}
+    if min(counts) == 0 or max(counts) > max_patch_faces:
+        return {'verified': False, 'reason': 'local_proof_patch_limit', 'patch_faces': counts}
+    old_patch = reference.cloneRegion(mn.faceBitSetFromBools(old_changed))
+    new_patch = candidate.cloneRegion(mn.faceBitSetFromBools(new_changed))
+    proof = verify_surface_bound(old_patch, new_patch, tolerance, progress,
+                                 acceleration=acceleration, emit=emit)
+    proof.update(reference='reconstructed_mesh_before_local_fix', patch_faces=counts,
+                 unchanged_faces_skipped=int(old_valid.sum())-counts[0],
+                 method='changed_patches_with_unchanged_face_identity')
+    return proof
+
+
 def verify_surface_bound(reference, candidate, tolerance, progress=lambda value: None,
                          max_depth=32, max_checks=None, acceleration=None, emit=lambda message: None):
     """Conservative adaptive bidirectional bound; uncertainty REJECTS simplification.

@@ -601,7 +601,7 @@ class MESHREPAIR_PT_panel(Panel):
             advanced.enabled = not runtime.busy
             advanced.prop(settings, "restore_sharp_edges")
             advanced.prop(settings, "collapse_coplanar")
-            if settings.collapse_coplanar and not settings.simplify_curved:
+            if settings.collapse_coplanar:
                 advanced.prop(settings, "coplanar_angle_deg")
             advanced.prop(settings, "simplify_curved")
             advanced.prop(settings, "strict_tolerance")

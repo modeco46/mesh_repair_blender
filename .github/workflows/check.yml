@@ -2,7 +2,7 @@ name: Check and build add-on
 
 on:
   push:
-    branches: [main]
+    branches: [main, experimental/1.2.0]
   pull_request:
     branches: [main]
 
@@ -30,7 +30,7 @@ jobs:
         with:
           python-version: "3.13"
       - run: python scripts/build_release.py --target windows-x64
-      - run: python scripts/smoke_release.py dist/mesh-repair-blender-1.1.3-windows-x64.zip
+      - run: python scripts/smoke_release.py dist/mesh-repair-blender-1.2.0-windows-x64.zip
       - name: Check Blender 5.3 on Windows
         env:
           BLENDER_TEST_DIR: ${{ runner.temp }}/blender-test
@@ -44,7 +44,7 @@ jobs:
           Expand-Archive $archive $env:BLENDER_TEST_DIR
           $blender = Join-Path $env:BLENDER_TEST_DIR 'blender-5.3.0-windows-x64'
           $env:MESH_REPAIR_ADDON_ROOT = Join-Path $env:BLENDER_TEST_DIR 'addon'
-          Expand-Archive dist/mesh-repair-blender-1.1.3-windows-x64.zip $env:MESH_REPAIR_ADDON_ROOT
+          Expand-Archive dist/mesh-repair-blender-1.2.0-windows-x64.zip $env:MESH_REPAIR_ADDON_ROOT
           $env:MESH_REPAIR_PYTHON = Join-Path $blender '5.3/python/bin/python.exe'
           & "$blender/blender.exe" --background --factory-startup --python-exit-code 1 --python tests/blender_smoke.py
           if ($LASTEXITCODE -ne 0) { throw 'Blender smoke test failed' }
@@ -52,6 +52,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Blender UI smoke test failed' }
       - uses: actions/upload-artifact@v4
         with:
-          name: mesh-repair-blender-1.1.3-windows-x64
+          name: mesh-repair-blender-1.2.0-windows-x64
           path: dist/*.zip
           retention-days: 30

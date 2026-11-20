@@ -52,6 +52,9 @@ def main():
         ]
         subprocess.run(command, check=True)
         assert json.loads(result.read_text(encoding="utf-8"))["status"] == "ok"
+        report = json.loads((folder / "report.json").read_text(encoding="utf-8"))
+        assert report["serialization"]["verified"] and report["final_roundtrips"] == 0
+        assert not (folder / "job" / "result.stl").exists()
         repaired = create_mesh_object(bpy.context, folder / "vertices.npy", folder / "faces.npy",
                                       "Cube_repaired", exported["mm_per_blender_unit"])
         assert len(repaired.data.polygons) == 12
@@ -65,6 +68,18 @@ def main():
         assert all(s.shading.color_type == "VERTEX" and s.shading.light == "FLAT" for s in spaces)
         heatmap.hide()
         assert [(s.shading.type, s.shading.color_type, s.shading.light) for s in spaces] == previous
+        # Coincident vertices belonging to separate shells must stay separate
+        # through Blender's bulk import and mesh.validate(), as in the worker.
+        vertices = np.load(folder / "vertices.npy")
+        faces = np.load(folder / "faces.npy")
+        np.save(folder / "touching-vertices.npy", np.concatenate((vertices, vertices + 2)))
+        np.save(folder / "touching-faces.npy", np.concatenate((faces, faces + len(vertices))))
+        touching = create_mesh_object(bpy.context, folder / "touching-vertices.npy",
+                                      folder / "touching-faces.npy", "Touching_shells", 1)
+        assert len(touching.data.vertices) == 16 and len(touching.data.polygons) == 24
+        imported = np.empty((16, 3), np.float32)
+        touching.data.vertices.foreach_get("co", imported.reshape(-1))
+        assert len(np.unique(imported, axis=0)) == 15
         # TIMER progress must explicitly invalidate the 3D area's sidebar without a mouse event.
         redraws = []
         area = SimpleNamespace(type="VIEW_3D", tag_redraw=lambda: redraws.append(True))
@@ -72,7 +87,8 @@ def main():
         fake_context = SimpleNamespace(window_manager=SimpleNamespace(
             mesh_repair_runtime=runtime, windows=[SimpleNamespace(screen=SimpleNamespace(areas=[area]))]))
         progress_file = folder / "timer-progress.jsonl"
-        progress_file.write_text('{"type":"progress","value":{"percent":35,"stage":"test"}}\n')
+        progress_file.write_text('{"type":"progress","value":{"percent":35,"stage":"test",'
+                                 '"estimated_triangles":12800000}}\n')
         addon._ACTIVE = {"id": "test", "timer": "test-timer", "progress_file": progress_file,
                          "progress_offset": 0, "progress_pending": b"", "process": SimpleNamespace(poll=lambda: None)}
         modal = addon._MeshRepairModal()
@@ -81,6 +97,7 @@ def main():
         assert "timer" not in bpy.types.Event.bl_rna.properties
         assert modal.modal(fake_context, SimpleNamespace(type="TIMER")) == {"PASS_THROUGH"}
         assert runtime.progress == 35 and redraws
+        assert runtime.estimated_triangles == 12800000
         addon._ACTIVE = None
     mesh_repair_blender.unregister()
     print("MESH_REPAIR_BLENDER_SMOKE_OK")

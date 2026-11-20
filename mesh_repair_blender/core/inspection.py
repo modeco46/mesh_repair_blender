@@ -5,6 +5,7 @@ import numpy as np
 from .engine import Progress, diagnostics
 from .compute import capabilities
 from .orientation import finite_vertices, prepare_orientation
+from .components import component_labels
 
 
 def load(source, tracker):
@@ -36,19 +37,25 @@ def basic_info(mesh, mm):
 def shell_summary(mesh, mm):
     from meshlib import mrmeshnumpy as mn
     mesh.pack()
-    mapping, count = mm.MeshComponents.getAllComponentsMap(mm.MeshPart(mesh))
-    groups = np.fromiter((int(x) for x in mapping), dtype=np.int32, count=mapping.size())
+    groups, count = component_labels(mesh, mm)
     sizes = np.bincount(groups, minlength=count)
     boundary = mesh.topology.findLeftBdEdges()
     adjacent = np.fromiter((int(mesh.topology.right(e)) for e in boundary), dtype=np.int32, count=boundary.count())
     open_edges = np.bincount(groups[adjacent], minlength=count)
     minimum, maximum = np.full((count, 3), np.inf), np.full((count, 3), -np.inf)
-    verts, faces = mn.getNumpyVerts(mesh), mn.getNumpyFaces(mesh.topology)
-    for start in range(0, len(faces), 131072):
-        sl = slice(start, start+131072)
-        tri = verts[faces[sl]]
-        np.minimum.at(minimum, groups[sl], tri.min(axis=1))
-        np.maximum.at(maximum, groups[sl], tri.max(axis=1))
+    if count == 1:
+        # A repaired solid usually has one shell. Its native vertex box avoids
+        # revisiting every corner of millions of triangles for report metadata.
+        box = mesh.computeBoundingBox()
+        minimum[0] = [box.min.x, box.min.y, box.min.z]
+        maximum[0] = [box.max.x, box.max.y, box.max.z]
+    else:
+        verts, faces = mn.getNumpyVerts(mesh), mn.getNumpyFaces(mesh.topology)
+        for start in range(0, len(faces), 131072):
+            sl = slice(start, start+131072)
+            tri = verts[faces[sl]]
+            np.minimum.at(minimum, groups[sl], tri.min(axis=1))
+            np.maximum.at(maximum, groups[sl], tri.max(axis=1))
     order = np.argsort(-sizes)[:2000]
     largest = int(np.argmax(sizes))
     shells = [{'id': int(i)+1, 'triangles': int(sizes[i]), 'closed': bool(open_edges[i] == 0),

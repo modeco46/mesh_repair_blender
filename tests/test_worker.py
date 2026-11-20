@@ -41,6 +41,7 @@ def test_worker_failure_writes_downloadable_diagnostic_report(tmp_path):
         sys.executable, str(WORKER), "repair", "--source", str(source), "--settings", str(settings),
         "--job-dir", str(tmp_path / "job"), "--progress-file", str(tmp_path / "progress.jsonl"),
         "--result-file", str(result),
+        "--vertices", str(tmp_path / "vertices.npy"), "--faces", str(tmp_path / "faces.npy"),
     ], capture_output=True, text=True)
     assert process.returncode == 1
     result_data = json.loads(result.read_text(encoding="utf-8"))

@@ -3,18 +3,23 @@ import time
 import numpy as np
 
 
-def triangle_distribution(reference, result, mm, tolerance, angle_deg=8., minimum_area=3.):
+def triangle_distribution(reference, result, mm, tolerance, angle_deg=8., minimum_area=3., sample_limit=250_000):
     from meshlib import mrmeshnumpy as mn
     from .reduction import projection_arrays
     started = time.monotonic()
     result.pack()
     verts = mn.getNumpyVerts(result).astype(float)
     faces = mn.getNumpyFaces(result.topology)
+    total_triangles = len(faces)
+    sampled = total_triangles > sample_limit
+    if sampled:
+        faces = faces[np.linspace(0, total_triangles-1, sample_limit, dtype=np.int64)]
+    sample_weight = total_triangles/len(faces)
     triangles = verts[faces]
     cross = np.cross(triangles[:, 1]-triangles[:, 0], triangles[:, 2]-triangles[:, 0])
     lengths = np.linalg.norm(cross, axis=1)
     normals = cross / np.maximum(lengths[:, None], np.finfo(float).tiny)
-    areas = lengths*.5
+    areas = lengths*.5*sample_weight
     centers = triangles.mean(axis=1)
     # Quantization supplies at most 64 dominant seeds. Every actual assignment
     # uses the exact angular criterion, not the quantized bins.
@@ -48,9 +53,9 @@ def triangle_distribution(reference, result, mm, tolerance, angle_deg=8., minimu
             center = np.average(centers[subset], axis=0, weights=areas[subset])
             assigned[subset] = len(groups)
             groups.append({'id': len(groups)+1, 'normal': normal.tolist(), 'center_mm': center.tolist(),
-                           'area_mm2': area, 'triangles': len(subset),
+                           'area_mm2': area, 'triangles': int(round(len(subset)*sample_weight)),
                            'fraction': len(subset)/max(1, len(faces))})
-    if groups:
+    if groups and not sampled:
         # One native projector for all original vertices. Nearest result faces
         # identify the corresponding original region without axis assumptions.
         projector = mm.PointsToMeshProjector()
@@ -76,11 +81,17 @@ def triangle_distribution(reference, result, mm, tolerance, angle_deg=8., minimu
             group['source_residual_p50_mm'] = float(np.quantile(values, .5)) if len(values) else None
             group['source_residual_p90_mm'] = float(np.quantile(values, .9)) if len(values) else None
             group['rougher_than_tolerance'] = bool(len(values) and group['source_residual_p90_mm'] > tolerance)
-    planar = int(np.count_nonzero(assigned >= 0))
+    if sampled:
+        for group in groups:
+            group.update(source_vertices=0, source_residual_p50_mm=None,
+                         source_residual_p90_mm=None, rougher_than_tolerance=None)
+    planar = int(round(np.count_nonzero(assigned >= 0)*sample_weight))
     return {'method': 'dominant_normal_clusters_and_nearest_source_vertices', 'angle_deg': angle_deg,
-            'minimum_area_mm2': minimum_area, 'planes': groups, 'total_triangles': len(faces),
-            'large_planes_triangles': planar, 'other_triangles': len(faces)-planar,
-            'large_planes_fraction': planar/max(1, len(faces)), 'other_fraction': 1-planar/max(1, len(faces)),
+            'minimum_area_mm2': minimum_area, 'planes': groups, 'total_triangles': total_triangles,
+            'sampled': sampled, 'analyzed_triangles': len(faces), 'counts_are_estimates': sampled,
+            'source_residuals_available': not sampled,
+            'large_planes_triangles': planar, 'other_triangles': total_triangles-planar,
+            'large_planes_fraction': planar/max(1, total_triangles), 'other_fraction': 1-planar/max(1, total_triangles),
             'elapsed_seconds': time.monotonic()-started,
             'tolerance_hint': {'kind': 'heuristic_not_prediction', 'tolerance_multiplier': 2.5,
                                'approximate_triangle_reduction_fraction': .25}}

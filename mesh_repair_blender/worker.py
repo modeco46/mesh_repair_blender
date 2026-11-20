@@ -48,16 +48,6 @@ class Channel:
         self.stream.close()
 
 
-def _export_arrays(stl_path: Path, vertices_path: Path, faces_path: Path) -> None:
-    import numpy as np
-    from meshlib import mrmeshpy as mm, mrmeshnumpy as mn
-
-    mesh = mm.loadMesh(stl_path)
-    mesh.pack()
-    np.save(vertices_path, np.asarray(mn.getNumpyVerts(mesh), dtype=np.float32), allow_pickle=False)
-    np.save(faces_path, np.asarray(mn.getNumpyFaces(mesh.topology), dtype=np.int32), allow_pickle=False)
-
-
 def main(argv=None) -> int:
     if argv is None and "--" in sys.argv:
         argv = sys.argv[sys.argv.index("--") + 1:]
@@ -92,11 +82,11 @@ def main(argv=None) -> int:
             report = inspect_mesh(args.source, lambda text: channel.send("log", text),
                                   lambda event: channel.send("progress", event))
         else:
-            report = run(args.source, settings=settings, emit=lambda text: channel.send("log", text),
-                         progress=lambda event: channel.send("progress", event), work_dir=args.job_dir)
             if args.vertices is None or args.faces is None:
                 raise ValueError("Result array paths are required for repair.")
-            _export_arrays(Path(report["artifacts"]["stl"]), args.vertices, args.faces)
+            report = run(args.source, settings=settings, emit=lambda text: channel.send("log", text),
+                         progress=lambda event: channel.send("progress", event), work_dir=args.job_dir,
+                         array_output=(args.vertices, args.faces))
         report = clean_json(report)
         report_path = args.job_dir.parent / "report.json"
         _atomic_json(report_path, report)

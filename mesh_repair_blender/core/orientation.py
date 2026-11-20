@@ -8,6 +8,7 @@ import time
 import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
+from .components import component_labels
 
 
 def finite_vertices(verts):
@@ -106,6 +107,7 @@ def prepare_orientation(mesh, mm, progress=lambda value: None, weld_tolerance=0)
     started = time.monotonic()
     mesh = mm.Mesh(mesh)
     mesh.pack()
+    unchanged_copy = mesh
     before = mm.MeshComponents.getNumComponents(mm.MeshPart(mesh))
     verts, faces = mn.getNumpyVerts(mesh), mn.getNumpyFaces(mesh.topology)
     finite_vertices(verts)
@@ -113,6 +115,9 @@ def prepare_orientation(mesh, mm, progress=lambda value: None, weld_tolerance=0)
     verts, faces, degenerate = weld(verts, faces)
     progress(.3)
     faces, report = orient_consistently(verts, faces)
+    # Orientation regions split at ambiguous edges; connected shells do not.
+    report['orientation_regions'] = {key: report.pop(key) for key in
+                                    ('components', 'closed_components', 'open_components')}
     report.update(components_before=before, components_after=before,
                   removed_degenerate_faces=degenerate, approximate_weld_mm=weld_tolerance)
     progress(.7)
@@ -129,12 +134,23 @@ def prepare_orientation(mesh, mm, progress=lambda value: None, weld_tolerance=0)
                 mesh = candidate
             if weld_tolerance:
                 count_before = mesh.topology.numValidFaces()
-                mm.uniteCloseVertices(mesh, weld_tolerance)
-                mesh, followup = prepare_orientation(mesh, mm)
-                report['approximate_weld_followup'] = followup
+                united = mm.uniteCloseVertices(mesh, weld_tolerance)
+                report['approximate_weld_united_vertices'] = united
+                if united:
+                    mesh, followup = prepare_orientation(mesh, mm)
+                    report['approximate_weld_followup'] = followup
                 report['approximate_weld_removed_faces'] = count_before-mesh.topology.numValidFaces()
             report['components_after'] = mm.MeshComponents.getNumComponents(mm.MeshPart(mesh))
             report['closed_after'] = mesh.topology.isClosed()
+    report['collision_geometry_unchanged'] = (mesh is unchanged_copy and
+                                              not report.get('approximate_weld_united_vertices', 0))
+    labels, count = component_labels(mesh, mm)
+    boundary = mesh.topology.findLeftBdEdges()
+    adjacent = np.fromiter((int(mesh.topology.right(e)) for e in boundary), dtype=np.int32,
+                           count=boundary.count())
+    open_count = len(np.unique(labels[adjacent]))
+    report.update(components=count, closed_components=count-open_count, open_components=open_count,
+                  component_definition='meshlib_per_edge_connectivity')
     progress(1)
     report['elapsed_seconds'] = time.monotonic() - started
     return mesh, report
@@ -144,8 +160,7 @@ def orient_closed_components(mesh, mm):
     """Safety pass for winding reconstruction: never flip an open component."""
     from meshlib import mrmeshnumpy as mn
     mesh.pack()
-    mapping, count = mm.MeshComponents.getAllComponentsMap(mm.MeshPart(mesh))
-    labels = np.fromiter((int(x) for x in mapping), dtype=np.int32, count=mapping.size())
+    labels, count = component_labels(mesh, mm)
     closed = np.ones(count, bool)
     edges = mesh.topology.findLeftBdEdges()
     adjacent = np.fromiter((int(mesh.topology.right(e)) for e in edges), dtype=np.int32, count=edges.count())

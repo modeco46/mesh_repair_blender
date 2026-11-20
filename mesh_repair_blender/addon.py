@@ -26,7 +26,8 @@ _LAST_REPAIR = None
 
 class MeshRepairSettings(PropertyGroup):
     quality_mm: FloatProperty(
-        name="Допуск, мм", description="Шаг ремонта и предел упрощения", default=0.02,
+        name="Допуск, мм", description="Шаг вокселей и предел упрощения относительно восстановленной сетки; "
+        "не общий предел отклонения от повреждённого исходника", default=0.02,
         min=0.001, max=0.5, precision=3,
     )
     collapse_coplanar: BoolProperty(name="Схлопывать плоскости", default=True)
@@ -35,6 +36,8 @@ class MeshRepairSettings(PropertyGroup):
         default=1.0, min=0.0, max=45.0,
     )
     simplify_curved: BoolProperty(name="Упрощать всю поверхность", default=True)
+    planar_finish_always: BoolProperty(name="Всегда обрабатывать плоскости", default=False,
+        description="Выполнять финальный проход даже при малом ожидаемом сокращении числа граней")
     strict_tolerance: BoolProperty(
         name="Строго доказывать допуск", default=False,
         description="Медленная численная верхняя граница для всей поверхности",
@@ -57,6 +60,7 @@ class MeshRepairSettings(PropertyGroup):
 class MeshRepairRuntime(PropertyGroup):
     busy: BoolProperty(default=False, options={"SKIP_SAVE"})
     progress: IntProperty(default=0, min=0, max=100, subtype="PERCENTAGE", options={"SKIP_SAVE"})
+    estimated_triangles: FloatProperty(default=0, min=0, options={"SKIP_SAVE"})
     stage: StringProperty(default="Готово", options={"SKIP_SAVE"})
     message: StringProperty(default="", options={"SKIP_SAVE"})
     last_log: StringProperty(default="", options={"SKIP_SAVE"})
@@ -91,6 +95,7 @@ def _settings_dict(settings, force_no_sharp=False):
         "quality_mm": settings.quality_mm,
         "collapse_coplanar": settings.collapse_coplanar,
         "coplanar_angle_deg": settings.coplanar_angle_deg,
+        "planar_finish_always": settings.planar_finish_always,
         "simplify_curved": settings.simplify_curved,
         "strict_tolerance": settings.strict_tolerance,
         "weld_close_vertices": settings.weld_close_vertices,
@@ -166,11 +171,15 @@ def _read_progress(job, runtime):
             value = event.get("value", {})
             runtime.progress = max(runtime.progress, int(value.get("percent", 0)))
             runtime.stage = str(value.get("stage", runtime.stage))
+            if 'estimated_triangles' in value:
+                runtime.estimated_triangles = float(value['estimated_triangles'])
         elif event.get("type") == "log":
             runtime.last_log = str(event.get("value", ""))[-1024:]
 
 
 def _store_report(name, report):
+    from . import bl_info
+    report['blender_addon_version'] = '.'.join(map(str, bl_info['version']))
     base = f"MeshRepair Report - {name}"
     text = bpy.data.texts.new(base)
     text.write(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False))
@@ -300,6 +309,7 @@ def _begin(context, operation, operator, force_no_sharp=False):
     runtime.busy = True
     runtime.operation = operation
     runtime.progress = 0
+    runtime.estimated_triangles = 0
     runtime.stage = "Подготовка геометрии"
     runtime.message = ""
     runtime.last_log = ""
@@ -559,6 +569,8 @@ class MESHREPAIR_PT_panel(Panel):
         _metric(box, "Выбрано", selected)
         box.label(text=_stage_label(runtime))
         if runtime.busy:
+            if runtime.estimated_triangles:
+                _metric(box, "Ожидается граней", f"≈ {runtime.estimated_triangles/1e6:.1f} млн")
             box.progress(factor=runtime.progress / 100, type="BAR", text=f"{runtime.progress}%")
             box.operator("mesh_repair.stop", icon="CANCEL")
         if runtime.has_result:
@@ -603,6 +615,7 @@ class MESHREPAIR_PT_panel(Panel):
             advanced.prop(settings, "collapse_coplanar")
             if settings.collapse_coplanar:
                 advanced.prop(settings, "coplanar_angle_deg")
+                advanced.prop(settings, "planar_finish_always")
             advanced.prop(settings, "simplify_curved")
             advanced.prop(settings, "strict_tolerance")
             advanced.prop(settings, "weld_close_vertices")

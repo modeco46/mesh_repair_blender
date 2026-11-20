@@ -8,6 +8,7 @@ import tempfile
 import time
 import numpy as np
 from .compute import capabilities, cuda_module
+from .components import component_labels
 
 
 DENSE_WINDING_VOXEL_LIMIT = 64_000_000
@@ -18,6 +19,7 @@ class Settings:
     quality_mm: float = 0.02
     collapse_coplanar: bool = False
     coplanar_angle_deg: float = 1.0
+    planar_finish_always: bool = False
     simplify_curved: bool = False
     strict_tolerance: bool = False
     weld_close_vertices: bool = False
@@ -169,17 +171,21 @@ def union_small(mesh, mm, tracker, deadline=None):
     return result
 
 
-def shell_intersection_split(mesh, mm):
+def shell_intersection_split(mesh, mm, *, include_regions=False):
     """Colliding triangle pairs inside one shell versus between different shells."""
     pairs = mm.findSelfCollidingTriangles(mm.MeshPart(mesh))
     if not len(pairs):
-        return 0, 0
-    mapping, _ = mm.MeshComponents.getAllComponentsMap(mm.MeshPart(mesh))
-    labels = np.fromiter((int(value) for value in mapping), dtype=np.int64)
+        return (0, 0, set(), 0) if include_regions else (0, 0)
+    labels, _ = component_labels(mesh, mm)
     first = np.fromiter((int(pair.aFace) for pair in pairs), dtype=np.int64, count=len(pairs))
     second = np.fromiter((int(pair.bFace) for pair in pairs), dtype=np.int64, count=len(pairs))
-    same = int((labels[first] == labels[second]).sum())
-    return same, len(pairs) - same
+    internal = labels[first] == labels[second]
+    same = int(internal.sum())
+    if include_regions:
+        regions = set(int(x) for x in np.unique(labels[first[internal]]))
+        faces = len(np.unique(np.r_[first[internal], second[internal]]))
+        return same, len(pairs)-same, regions, faces
+    return same, len(pairs)-same
 
 
 def union_between_shells(mesh, info, mm, settings, tracker, report, emit):
@@ -192,18 +198,25 @@ def union_between_shells(mesh, info, mm, settings, tracker, report, emit):
         item['reason'] = 'too_many_intersections'
         return None, None
     started = time.monotonic()
-    inside, between = shell_intersection_split(mesh, mm)
+    inside, between, damaged_regions, internal_faces = shell_intersection_split(mesh, mm, include_regions=True)
     item.update(pairs_inside_shell=inside, pairs_between_shells=between, split_seconds=time.monotonic()-started)
-    if inside or not between:
-        item['reason'] = 'intersections_inside_shell' if inside else 'no_pairs'
-        emit(f'Пересечения внутри одной оболочки ({inside}); булево объединение оболочек не применяется.' if inside
-             else 'Пары пересекающихся граней не найдены; булево объединение не применяется.')
+    item['faces_inside_shell'] = internal_faces
+    operand = mesh
+    if inside:
+        from .surface_paths import repair_shells_before_union
+        operand = repair_shells_before_union(mesh, info, damaged_regions, internal_faces,
+                                             mm, settings, tracker, report, emit)
+        if operand is None:
+            item['reason'] = 'shell_local_repair_failed'
+            return None, None
+    elif not between:
+        item['reason'] = 'no_pairs'
         return None, None
     item['attempted'] = True
-    emit(f"Пересечения только между оболочками ({between:,} пар, оболочек {info['components']}): булево объединение без вокселей.")
+    emit(f"Булево объединение проверенных оболочек: {info['components']}; межоболочечных пар {between:,}.")
     started = time.monotonic()
     try:
-        repaired = union_small(mesh, mm, tracker, deadline=started + settings.union_max_seconds)
+        repaired = union_small(operand, mm, tracker, deadline=started + settings.union_max_seconds)
         if time.monotonic()-started >= settings.union_max_seconds:
             raise RuntimeError('Превышен лимит времени объединения оболочек.')
         after = diagnostics(repaired, mm)
@@ -218,7 +231,7 @@ def union_between_shells(mesh, info, mm, settings, tracker, report, emit):
         emit('Результат объединения не прошёл проверку; воксельное восстановление.')
         return None, None
     item.update(accepted=True, after=after)
-    report['algorithm'] = 'solid_union'
+    report['algorithm'] = 'solid_union_after_local_shell_repair' if inside else 'solid_union'
     return repaired, after
 
 
@@ -242,6 +255,11 @@ def drop_cavities(mesh, after, mm, report, emit, quality_mm):
         drop |= region
     cleaned = mesh.cloneRegion(mesh.topology.getValidFaces()-drop)
     report['removed_cavities'] = [{'triangles': region.count(), 'volume_mm3': volume} for region, volume in voids]
+    for region, volume in voids:
+        box = mesh.computeBoundingBox(region)
+        report.setdefault('removed_geometry', []).append({'triangles': region.count(), 'volume_mm3': volume,
+            'reason': 'cavity_or_zero_thickness', 'stage': 'cavities',
+            'bbox_min_mm': [box.min.x, box.min.y, box.min.z], 'bbox_max_mm': [box.max.x, box.max.y, box.max.z]})
     emit(f"Удалено внутренних полостей и пластин нулевой толщины: {len(voids)} (граней {drop.count():,}).")
     return cleaned, dict(topology_info(cleaned, mm), self_intersecting_faces=0), mesh
 
@@ -265,7 +283,10 @@ def clean_reconstruction_artifacts(mesh, info, mm, settings, report, emit):
         cavity = volume <= negligible
         if cavity or (settings.remove_small_shells and count < 50):
             drop |= region
+            box = mesh.computeBoundingBox(region)
             removed.append({'triangles': count, 'volume_mm3': volume,
+                            'bbox_min_mm': [box.min.x, box.min.y, box.min.z],
+                            'bbox_max_mm': [box.max.x, box.max.y, box.max.z],
                             'reason': 'cavity_or_zero_thickness' if cavity else 'small_shell'})
     item = report['reconstruction_artifacts'] = {'before': info, 'accepted': False, 'removed': []}
     if 0 < drop.count() < info['triangles']:
@@ -273,6 +294,8 @@ def clean_reconstruction_artifacts(mesh, info, mm, settings, report, emit):
         after = diagnostics(candidate, mm)
         if after['closed'] and after['topology_valid'] and after['triangles']:
             item.update(accepted=True, removed=removed, after=after)
+            report.setdefault('removed_geometry', []).extend(
+                dict(part, stage='reconstruction_artifacts') for part in removed)
             emit(f"Воксельные полости/мелкие оболочки: удалено {len(removed)}; "
                  f"пересекающихся граней {info['self_intersecting_faces']} → {after['self_intersecting_faces']}.")
             mesh, info = candidate, after
@@ -284,6 +307,7 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
     """Validate the full result and reuse winding data for a bounded retry."""
     from .orientation import orient_closed_components
     report.update(algorithm='sparse_openvdb_winding', voxel_size_mm=settings.quality_mm)
+    tracker.update(32, 'Подготовка воксельного расчёта')
     report['sparse_closed_orientation_corrections'] = orient_closed_components(mesh, mm)
     sharp = report['sharpening'] = {'requested': settings.restore_sharp_edges, 'accepted': False}
     report['compute_device'] = 'cpu_native_parallel'
@@ -397,6 +421,12 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
         eta = estimated_seconds = probe_seconds*cells/probe_cells
         report['voxel_estimate'].update(estimated_seconds=eta, probe_seconds=probe_seconds, probe_cells=probe_cells,
                                        probe_factor=probe_factor, estimated_output_triangles=output_triangles)
+        if output_triangles > 5_000_000:
+            message = f'Ожидается около {output_triangles/1e6:.1f} млн промежуточных граней; обработка потребует много RAM.'
+            report['warnings'].append(message)
+            emit(message)
+            tracker.emit({'percent': tracker.percent, 'stage': tracker.stage,
+                          'estimated_triangles': output_triangles})
         emit(f'Оценка только воксельного расчёта по пробе (шаг ×{probe_factor}): ≈ {eta:,.0f} с; '
              f'промежуточная поверхность ≈ {output_triangles:,} треугольников. '
              'Проверка и упрощение требуют дополнительного времени.')
@@ -437,12 +467,14 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
     def full_result(sharpen, winding_beta=2.0, deadline=None):
         result = reconstruct(sharpen, settings.quality_mm, winding_beta=winding_beta,
                              stage='Уточнение воксельной поверхности' if winding_beta > 2 else None, deadline=deadline)
+        tracker.update(65, 'Проверка извлечённой поверхности')
         if translation is not None:
             result.transform(mm.AffineXf3f.translation(translation))
         # Validate in output coordinates, once per full candidate. Never try
         # CutAndFill on a failed full-resolution Sharpening reconstruction.
         check = diagnostics(result, mm)
         if not sharpen and not valid(check):
+            tracker.update(65, 'Очистка артефактов реконструкции')
             result, check = clean_reconstruction_artifacts(result, check, mm, settings, report, emit)
         if not sharpen and check['topology_valid'] and not check['closed']:
             from .seams import fill_voxel_seams
@@ -519,15 +551,22 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
             finally:
                 retry['elapsed_seconds'] = time.monotonic()-started
     sharp['accepted'] = use_sharp
+    full_passes = [p['elapsed_seconds'] for p in report['voxel_passes'] if not p['probe']]
+    report['voxel_estimate'].update(estimate_is_heuristic=True, actual_full_passes_seconds=full_passes)
+    if full_passes and report['voxel_estimate']['estimated_seconds']:
+        report['voxel_estimate']['estimate_to_first_actual_ratio'] = (
+            report['voxel_estimate']['estimated_seconds']/max(full_passes[0], 1e-9))
     report['reconstruction_validation'] = check
     return result
 
 
-def repair_reconstruction_intersections(mesh, info, mm, settings, tracker, report, emit):
+def repair_reconstruction_intersections(mesh, info, mm, settings, tracker, report, emit, *,
+        report_key='reconstruction_local_repair', proof_reference='reconstructed_mesh_before_local_fix',
+        stage='Локальное исправление воксельной поверхности', span=(65, 66), deadline=None):
     """Keep bounded partial improvements and work on remaining collisions only."""
     from . import reduction as rd
     threshold = max(settings.local_fix_max_faces, int(info['triangles']*settings.local_fix_fraction))
-    item = report['reconstruction_local_repair'] = {
+    item = report[report_key] = {
         'attempted': False, 'accepted': False, 'before': info, 'threshold_faces': threshold,
         'tolerance_mm': settings.quality_mm*.25, 'maximum_tolerance_mm': settings.quality_mm*.5}
     if not (info['closed'] and info['topology_valid'] and 0 < info['self_intersecting_faces'] <= threshold):
@@ -535,8 +574,8 @@ def repair_reconstruction_intersections(mesh, info, mm, settings, tracker, repor
         return mesh, info
     item['attempted'] = True
     started = time.monotonic()
-    tracker.update(65, 'Локальное исправление воксельной поверхности')
-    emit(f"Воксельная поверхность: локальное исправление {info['self_intersecting_faces']} пересекающихся граней.")
+    tracker.update(span[0], stage)
+    emit(f"{stage}: {info['self_intersecting_faces']} пересекающихся граней.")
     item['attempts'] = []
     best, best_info = mesh, info
     best_collisions = mm.findSelfCollidingTrianglesBS(mm.MeshPart(mesh))
@@ -557,8 +596,9 @@ def repair_reconstruction_intersections(mesh, info, mm, settings, tracker, repor
                 proof = rd.vertex_displacement_bound(mesh, candidate, attempt['tolerance_mm'])
             else:
                 proof = rd.verify_local_surface_bound(mesh, candidate, attempt['tolerance_mm'],
-                    tracker.callback(65, 66, 'Проверка локального исправления'),
+                    tracker.callback(*span, 'Проверка локального исправления'),
                     acceleration=report.get('acceleration'), emit=emit)
+            proof['reference'] = proof_reference
             attempt['verification'] = proof
             if proof.get('verified'):
                 best, best_info, best_collisions = candidate, after, collisions
@@ -581,6 +621,9 @@ def repair_reconstruction_intersections(mesh, info, mm, settings, tracker, repor
                    ('native_relax', 0, 0, .25), ('cut_and_fill', 0, 0, .25),
                    ('bounded_relax', 2, 80, .5), ('cut_and_fill', 0, 0, .5)]
         for method, hops, iterations, fraction in methods:
+            if deadline is not None and time.monotonic() >= deadline:
+                item['time_budget_reached'] = True
+                break
             # Only a few residual faces may use the larger, still sub-voxel,
             # correction budget. It is always checked against the same origin.
             if fraction > .25 and best_info['self_intersecting_faces'] > 64:
@@ -628,7 +671,7 @@ def repair_reconstruction_intersections(mesh, info, mm, settings, tracker, repor
         item.update(after=best_info, partial_improvement=best is not mesh, reason='remaining_local_intersections')
     finally:
         item['elapsed_seconds'] = time.monotonic()-started
-        emit(f"Локальное исправление воксельной поверхности: {'принято' if item['accepted'] else 'отклонено'}; "
+        emit(f"{stage}: {'принято' if item['accepted'] else 'отклонено'}; "
              f"{item['elapsed_seconds']:.2f} с" + (f" [{item['reason']}]" if item.get('reason') else '.'))
     return best, best_info
 
@@ -740,17 +783,23 @@ def simplify_attempts(exported, tmp, mm, settings, tracker, report, emit, workdi
     started = time.monotonic()
     shellwise = False
     prepared = None
+    protection_points = None
+    protection_rounds = 0
 
-    def propose(factor, phase):
+    def propose(factor, phase, seed=None):
         nonlocal shellwise, prepared
+        work = exported if seed is None else seed
         item = {'attempt': len(summary['attempts'])+1, 'phase': phase, 'shellwise': shellwise,
-                'error_scale': factor, 'max_error_mm': settings.quality_mm*factor, 'checkpoints': []}
+                'error_scale': factor, 'max_error_mm': settings.quality_mm*factor, 'checkpoints': [],
+                'input_triangles': work.topology.numValidFaces(),
+                'distance_reference': 'repaired_mesh_before_simplification'}
         summary['attempts'].append(item)
         t = time.monotonic()
         last_valid = None
 
         def checkpoint(candidate, stages):
-            nonlocal last_valid
+            nonlocal last_valid, protection_points
+            repaired_checkpoint = False
             check = {'pass': len(stages), 'stages': stages}
             item['checkpoints'].append(check)
             if candidate.topology.numValidFaces() >= original['triangles']:
@@ -759,24 +808,55 @@ def simplify_attempts(exported, tmp, mm, settings, tracker, report, emit, workdi
             info = diagnostics(candidate, mm, tracker.callback(86, 88, 'Проверка упрощённой сетки'))
             if not valid(info) and mm.findDegenerateFaces(mm.MeshPart(candidate)).count():
                 cleanup_report = {'after': info, 'steps': [], 'warnings': []}
+                previous = candidate
                 candidate = cleanup_exported(candidate, None, mm, settings, tracker, cleanup_report, None, emit)
+                repaired_checkpoint = candidate is not previous
                 info = cleanup_report['after']
                 check['cleanup'] = cleanup_report['degenerate_cleanup']
             check['candidate'] = info
+            usable_topology = (info['closed'] and info['topology_valid'] and
+                               info['components'] == original['components'])
+            deviation = rd.measured_distance(exported, candidate, mm) if usable_topology else math.inf
+            check['verification'] = {'verified': False, 'mode': 'measured_not_proven',
+                'max_deviation_mm': deviation, 'reference': 'repaired_mesh_before_simplification',
+                'method': 'bidirectional_vertices_to_surface'}
+            if usable_topology and math.isfinite(deviation) and deviation > target:
+                check['reason'] = 'sample_exceeds_tolerance'
+                if seed is None and protection_rounds < 2:
+                    from .hotspots import distance_hotspots
+                    try:
+                        details, points = distance_hotspots(exported, candidate, target, mm,
+                            report.get('acceleration'), emit)
+                        check['hotspots'] = details
+                        if len(points):
+                            protection_points = points if protection_points is None else np.unique(
+                                np.concatenate((protection_points, points)), axis=0)
+                            check['protection_requested'] = True
+                    except (RuntimeError, MemoryError) as exc:
+                        check['hotspots'] = {'error': str(exc)}
+                return False
+            if usable_topology and deviation <= target and 0 < info['self_intersecting_faces'] <= 64:
+                from .surface_paths import rescue_decimated_surface
+                rescue = check['local_repair'] = {'acceleration': report.get('acceleration')}
+                previous = candidate
+                candidate, info = rescue_decimated_surface(exported, candidate, info, mm,
+                                                            settings, tracker, rescue, emit)
+                if candidate is not previous:
+                    repaired_checkpoint = True
+                    deviation = rescue['total_deviation_mm']
+                    check['verification']['max_deviation_mm'] = deviation
+            check['candidate'] = info
             if not valid(info):
-                check['reason'] = 'topology_changed'
+                check['reason'] = ('self_intersections' if info['closed'] and info['topology_valid']
+                                   and info['self_intersecting_faces'] else 'topology_changed')
             elif info['components'] != original['components']:
                 check['reason'] = 'kept_shell_count_changed'
             else:
                 tracker.update(88, f"Подбор допуска: {item['attempt']}")
-                deviation = rd.measured_distance(exported, candidate, mm)
-                check['verification'] = {'verified': False, 'mode': 'measured_not_proven',
-                    'max_deviation_mm': deviation, 'reference': 'repaired_mesh_before_simplification',
-                    'method': 'bidirectional_vertices_to_surface'}
                 if math.isfinite(deviation) and deviation <= target:
                     if last_valid is None or info['triangles'] < last_valid[1]['triangles']:
                         last_valid = candidate, info, check
-                    return True
+                    return candidate if repaired_checkpoint else True
                 check['reason'] = 'sample_exceeds_tolerance'
             emit(f"Попытка {item['attempt']}, проход {len(stages)} отклонён: {rd.reason_text(check['reason'])}")
             return False
@@ -788,13 +868,19 @@ def simplify_attempts(exported, tmp, mm, settings, tracker, report, emit, workdi
             per_pass = original['components'] == 1 and not shellwise
             options = {'checkpoint': checkpoint} if per_pass else {}
             if not shellwise:
-                if prepared is None:
+                if seed is not None:
+                    options['prepared'] = rd.prepare_reduction(work, mm)
+                elif prepared is None:
+                    tracker.update(77, 'Подготовка оболочек к упрощению')
                     prepared = rd.prepare_reduction(exported, mm)
                     summary['preparation_seconds'] = time.monotonic()-t
-                options['prepared'] = prepared
-            candidate, stages = reduce(exported, mm, settings, tracker, error_scale=factor,
+                if seed is None:
+                    options['prepared'] = prepared
+            candidate, stages = reduce(work, mm, settings, tracker, error_scale=factor,
+                protection_points=protection_points,
                 preserve_planar_corners=report.get('algorithm') in {
-                    'surface_repair', 'solid_union', 'closed_components_preserved'}, **options)
+                    'surface_repair', 'solid_union', 'solid_union_after_local_shell_repair',
+                    'closed_components_preserved'}, **options)
             if not item['checkpoints']:
                 checkpoint(candidate, stages)
             if not item['checkpoints']:
@@ -816,23 +902,49 @@ def simplify_attempts(exported, tmp, mm, settings, tracker, report, emit, workdi
             item.pop('reason', None)
             item.update(selected)
             return candidate, info, item
-        if item.get('reason') in {'topology_changed', 'kept_shell_count_changed'} and not shellwise \
+        if item.get('reason') in {'topology_changed', 'self_intersections', 'kept_shell_count_changed'} and not shellwise \
                 and original['components'] > 1:
             shellwise = True
             summary['shellwise'] = True
             emit('Общее упрощение меняет оболочки; упрощение каждой оболочки отдельно.')
-            return propose(factor, phase)
+            return propose(factor, phase, seed)
         return None, None, item
 
     best = None
+    stalled_refinements = 0
+    pending_factor, previous_excess = None, None
     low, high = 0., .8
     for iteration in range(6):
         # Preserve the first two historical probes for stable cases. If both
         # fail, approach zero instead of hitting the old hard floor of 0.15.
         factor = .475 if iteration == 0 else .3125 if iteration == 1 and best is None else (low+high)/2
-        candidate, info, item = propose(factor, 'search')
+        if pending_factor is not None:
+            factor, pending_factor = pending_factor, None
+        if protection_points is not None:
+            protection_rounds += 1
+        seed = None if best is None else best[0]
+        candidate, info, item = propose(factor, 'search' if seed is None else 'refine_accepted', seed)
+        improved = candidate is not None and (best is None or info['triangles'] < best[1]['triangles'])
+        if seed is not None:
+            stalled_refinements = 0 if improved else stalled_refinements+1
         if candidate is None:
-            high = factor
+            reason = item.get('reason')
+            excess = item.get('verification', {}).get('max_deviation_mm')
+            if item.get('protection_requested') and protection_rounds < 2:
+                pending_factor = factor
+                previous_excess = excess
+                continue
+            if reason == 'sample_exceeds_tolerance':
+                high = factor
+                if best is None and previous_excess is not None and excess is not None and math.isclose(
+                        excess, previous_excess, rel_tol=1e-5, abs_tol=settings.quality_mm*1e-4):
+                    summary['search_stop'] = 'distance_plateau_after_local_protection'
+                    break
+                previous_excess = excess
+            else:
+                # Intersections are not monotone in QEM error. Explore a
+                # different scale without treating them as a distance bound.
+                pending_factor = .3125 if iteration == 0 else factor*.5
             if item.get('reason') == 'no_reducible_edges':
                 break
         else:
@@ -844,9 +956,12 @@ def simplify_attempts(exported, tmp, mm, settings, tracker, report, emit, workdi
             if item['verification']['max_deviation_mm'] < settings.quality_mm*1e-4:
                 # Exact planar collapse has no unused curved error budget.
                 break
-            if item['verification']['max_deviation_mm'] >= target*.99:
-                summary['search_stop'] = 'within_one_percent_of_measured_target'
+            if item['verification']['max_deviation_mm'] >= target*.95:
+                summary['search_stop'] = 'within_five_percent_of_measured_target'
                 break
+        if stalled_refinements >= 2:
+            summary['search_stop'] = 'two_refinements_without_improvement'
+            break
 
     # Strict proof is intentionally outside the binary search. Each proof and
     # every retry uses the original repaired surface, never the previous pass.
@@ -905,8 +1020,14 @@ def finish_planar_faces(reference, current, mm, settings, tracker, report, emit)
     started = time.monotonic()
     tracker.update(94, 'Финальное схлопывание плоских участков')
     try:
-        # Existing vertices and ridge corners stay fixed. A single unpartitioned
-        # pass removes the artificial seams left by parallel general decimation.
+        screen_started = time.monotonic()
+        item['opportunity'] = rd.planar_opportunity(current, mm, settings)
+        item['screen_seconds'] = time.monotonic()-screen_started
+        if not item['opportunity']['run']:
+            item['reason'] = 'too_few_near_planar_vertices'
+            return current
+        # Small inputs use one unpartitioned pass to remove parallel QEM seams.
+        # Large inputs use native partitions to limit the planar CPU bottleneck.
         planar = replace(settings, simplify_curved=False, collapse_coplanar=True)
         # A simplified whole body can have <50 faces. The general reducer's
         # small-shell exclusion must not disable its planar finishing pass.
@@ -917,6 +1038,13 @@ def finish_planar_faces(reference, current, mm, settings, tracker, report, emit)
             item['reason'] = 'no_reducible_edges'
             return current
         after = item['candidate'] = diagnostics(candidate, mm)
+        if after['closed'] and after['topology_valid'] and after['components'] == before['components'] \
+                and 0 < after['self_intersecting_faces'] <= 64:
+            from .surface_paths import rescue_decimated_surface
+            rescue = item['local_repair'] = {'acceleration': report.get('acceleration')}
+            candidate, after = rescue_decimated_surface(reference, candidate, after, mm, settings,
+                                                         tracker, rescue, emit)
+            item['candidate'] = after
         if not valid(after) or after['components'] != before['components']:
             item['reason'] = 'planar_finish_topology_changed'
             return current
@@ -952,7 +1080,7 @@ def finish_planar_faces(reference, current, mm, settings, tracker, report, emit)
 
 
 def run(source, destination=None, settings=Settings(), emit=lambda message: None,
-        progress=lambda event: None, work_dir=None):
+        progress=lambda event: None, work_dir=None, *, array_output=None):
     from .storage import create_job, remove_job
     settings.validate()
     source = Path(source).resolve()
@@ -961,6 +1089,12 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
     if source.suffix.lower() not in {'.stl', '.obj', '.ply'}:
         raise ValueError('Поддерживаются STL, OBJ и PLY.')
     target = Path(destination).resolve() if destination else None
+    if array_output is not None and (target is not None or len(array_output) != 2):
+        raise ValueError('Передача массивов требует двух путей и не совместима с экспортом STL.')
+    if array_output is not None:
+        array_output = tuple(Path(path).resolve() for path in array_output)
+        if len(set(array_output)) != 2 or any(path == source or path.exists() for path in array_output):
+            raise ValueError('Массивы результата не должны перезаписывать исходник или существующие файлы.')
     if target:
         if target == source or any(Path(str(target)+suffix).exists() for suffix in ('', '.json', '.deviation.npz')):
             raise ValueError('Выходной файл уже существует. Исходники и результаты не перезаписываются.')
@@ -972,7 +1106,7 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
     report = {}
     started = time.monotonic()
     try:
-        report = _run(source, settings, emit, progress, folder, report)
+        report = _run(source, settings, emit, progress, folder, report, array_output=array_output)
         if target:
             _publish_cli(report, target)
         return clean_json(report)
@@ -1012,17 +1146,22 @@ def _publish_cli(report, target):
         report['warnings'].append('STL сохранён, но не удалось записать JSON-отчёт: '+str(exc))
 
 
-def _run(source, settings, emit, progress, folder, report=None):
+def _run(source, settings, emit, progress, folder, report=None, *, array_output=None):
     from meshlib import mrmeshpy as mm, mrmeshnumpy as mn
     from .orientation import prepare_orientation, finite_vertices
     from .inspection import describe_mesh
     started = time.monotonic()
     if report is None:
         report = {}
-    report.update({'version': '1.0.0', 'engine_revision': 'blender-1.1.3',
+    report.update({'version': '1.0.0', 'engine_revision': 'blender-1.2.0',
               'settings': asdict(settings), 'source': str(source),
               'units': 'mm', 'tolerance_certified': False, 'warnings': [], 'steps': [],
               'compute_device': 'cpu_native_parallel', 'acceleration': capabilities(settings.disable_cuda)})
+    report['tolerance_policy'] = {
+        'quality_mm': settings.quality_mm, 'meaning': 'voxel_step_and_simplification_budget',
+        'simplification_reference': 'repaired_mesh_before_simplification',
+        'source_distance_mode': 'measured_source_vertices_to_result',
+        'whole_repair_bound_certified': False, 'warning_threshold_mm': settings.quality_mm}
     report['stage_timings'] = []
     tracker = Progress(progress, emit, report['stage_timings'],
         lambda stage: report['compute_device'] if stage.startswith(
@@ -1070,7 +1209,12 @@ def _run(source, settings, emit, progress, folder, report=None):
         tracker.callback(18, 30, 'Заполнение простых дыр'), emit, defer_intersections=True)
     report['hole_filling'] = hole_report
     tracker.update(30, 'Проверка после заполнения дыр')
-    info = diagnostics(mesh, mm)
+    if orientation['collision_geometry_unchanged'] and not hole_report['filled']:
+        info = dict(topology_info(mesh, mm), self_intersecting_faces=before['self_intersecting_faces'])
+        report['post_hole_diagnostics'] = 'reused_unchanged_source_collisions'
+    else:
+        info = diagnostics(mesh, mm)
+        report['post_hole_diagnostics'] = 'recomputed_after_geometry_change'
     report['after_hole_filling'] = info
     repaired, after = local_repair(mesh, info, mm, settings, tracker, report, emit)
     pending = hole_report['pending_local_fix']
@@ -1135,8 +1279,8 @@ def _run(source, settings, emit, progress, folder, report=None):
         reason = 'После локального ремонта остались повреждения; выполнено воксельное восстановление.'
     elif report['algorithm'] == 'local_cut_and_fill':
         reason = 'Самопересечения устранены локально методом CutAndFill, без вокселизации модели.'
-    elif report['algorithm'] == 'solid_union' and report.get('union_attempt', {}).get('accepted'):
-        reason = 'Оболочки пересекались только друг с другом; объединены булевой операцией без вокселей.'
+    elif report['algorithm'].startswith('solid_union') and report.get('union_attempt', {}).get('accepted'):
+        reason = 'Проверенные оболочки объединены булевой операцией без вокселей.'
     else:
         reason = 'Ориентация и заполнение простых дыр позволили сохранить поверхность без вокселей.'
     report['algorithm_reason'] = reason
@@ -1154,6 +1298,7 @@ def _run(source, settings, emit, progress, folder, report=None):
     report['after'] = after
     # Retain valid native stages for a failed final STL round-trip, never disk copies.
     fallbacks = []
+    tracker.update(70, 'Очистка воксельных полостей')
     if report['algorithm'] == 'sparse_openvdb_winding':
         repaired, cleaned_after, before_cavities = drop_cavities(repaired, after, mm, report, emit, settings.quality_mm)
         if before_cavities is not None:
@@ -1161,24 +1306,31 @@ def _run(source, settings, emit, progress, folder, report=None):
             after = cleaned_after
             report['after'] = after
     if settings.remove_small_shells:
-        from .inspection import shell_summary
-        _, shells = shell_summary(repaired, mm)
+        tracker.update(73, 'Удаление мелких оболочек')
         regions = mm.MeshComponents.getAllComponents(mm.MeshPart(repaired))
         small = mm.FaceBitSet()
         for region in regions:
             if region.count() < 50:
                 small |= region
-        removed = [shell for shell in shells if shell['triangles'] < 50]
-        report['removed_shells'] = removed
+        # Only removed shells need boxes; do not scan millions of retained
+        # triangles just to describe an eight-face island.
+        removed = []
+        if small.count() and small.count() < repaired.topology.numValidFaces():
+            from .inspection import shell_summary
+            _, removed = shell_summary(repaired.cloneRegion(small), mm)
+        early_small = [x for x in report.get('removed_geometry', []) if x['reason'] == 'small_shell']
+        report['removed_shells'] = early_small + removed
         if small.count() and small.count() < repaired.topology.numValidFaces():
             fallbacks.append((repaired, after, 'small_shells'))
             repaired = repaired.cloneRegion(repaired.topology.getValidFaces()-small)
             after = dict(topology_info(repaired, mm), self_intersecting_faces=0)
             report['after'] = after
+            report.setdefault('removed_geometry', []).extend(
+                dict(part, stage='small_shells', reason='small_shell') for part in removed)
             emit(f'Удалено мелких оболочек: {len(removed)}.')
         elif small.count():
             report['warnings'].append('Все оболочки мелкие; удаление отменено, чтобы не получить пустой результат.')
-            report['removed_shells'] = []
+            report['removed_shells'] = early_small
     emit(f"После ремонта: {info['triangles']:,} → {after['triangles']:,} треугольников.")
     tmp = folder/'result.stl'
     final = repaired
@@ -1199,69 +1351,90 @@ def _run(source, settings, emit, progress, folder, report=None):
         if final is not before_planar:
             fallbacks.append((before_planar, before_planar_info, 'planar_finish'))
     t = time.monotonic()
-    roundtrips = []
-    while True:
-        save_settings = mm.SaveSettings()
-        save_settings.progress = tracker.callback(96, 97, 'Запись итогового STL')
-        mm.saveMesh(final, tmp, save_settings)
-        exported = mm.loadMesh(tmp)
-        final_info = diagnostics(exported, mm, tracker.callback(97, 98, 'Контроль итогового STL'))
-        roundtrips.append(final_info)
-        if valid(final_info):
-            shells_changed = final_info['components'] != report['after']['components']
-            if not shells_changed or not fallbacks:
-                if shells_changed:
-                    # STL stores triangle soup. Its loader can split coincident
-                    # voxel seams even when both meshes are closed and valid.
-                    # Optional changes are rolled back first; a valid base is
-                    # still usable, with the actual exported topology reported.
-                    report['export_topology'] = {'before': report['after'], 'after': final_info}
-                    report['warnings'].append(f"STL изменил связность при загрузке: {report['after']['components']} → "
-                        f"{final_info['components']} оболочек. Замкнутость, топология и отсутствие пересечений проверены; "
-                        'проверьте раздельные фрагменты. [stl_shell_count_changed]')
-                break
-        if not fallbacks:
-            raise RuntimeError('Итоговый STL не прошёл проверку; проверенные стадии исчерпаны.')
-        final, restored, stage = fallbacks.pop()
-        report['after'] = restored
-        report['warnings'].append(f'Итоговый STL не прошёл проверку; откат стадии [{stage}] и повторная запись.')
-        if stage == 'simplification':
-            from .reduction import reason_text
-            reason_code = 'export_validation_failed'
-            report['simplification'].update(accepted=False, after=restored['triangles'], reason=reason_code,
-                                             reason_ru=reason_text(reason_code))
-        elif stage == 'small_shells':
-            report['removed_shells'] = []
-        elif stage == 'cavities':
-            report['removed_cavities'] = []
-        elif stage == 'cleanup':
-            report['degenerate_cleanup'].update(accepted=False, reason='export_validation_failed')
-        elif stage == 'planar_finish':
-            report['planar_finish'].update(accepted=False, after=restored['triangles'],
-                                          reason='export_validation_failed')
+    if array_output is not None:
+        from .transfer import save_mesh_arrays
+        tracker.update(96, 'Передача проверенной сетки в Blender')
+        report['serialization'] = save_mesh_arrays(final, array_output)
+        exported, final_info = final, dict(report['after'])
+        roundtrips = []
+    else:
+        roundtrips = report['export_attempts'] = []
+        while True:
+            save_settings = mm.SaveSettings()
+            save_settings.progress = tracker.callback(96, 97, 'Запись итогового STL')
+            mm.saveMesh(final, tmp, save_settings)
+            exported = mm.loadMesh(tmp)
+            final_info = diagnostics(exported, mm, tracker.callback(97, 98, 'Контроль итогового STL'))
+            roundtrips.append(final_info)
+            if valid(final_info):
+                shells_changed = final_info['components'] != report['after']['components']
+                if not shells_changed or not fallbacks:
+                    if shells_changed:
+                        # STL stores triangle soup. Its loader can split coincident
+                        # voxel seams even when both meshes are closed and valid.
+                        # Optional changes are rolled back first; a valid base is
+                        # still usable, with the actual exported topology reported.
+                        report['export_topology'] = {'before': report['after'], 'after': final_info}
+                        report['warnings'].append(f"STL изменил связность при загрузке: {report['after']['components']} → "
+                            f"{final_info['components']} оболочек. Замкнутость, топология и отсутствие пересечений проверены; "
+                            'проверьте раздельные фрагменты. [stl_shell_count_changed]')
+                    break
+            if not fallbacks:
+                raise RuntimeError('Итоговый STL не прошёл проверку; проверенные стадии исчерпаны.')
+            final, restored, stage = fallbacks.pop()
+            report['after'] = restored
+            report['warnings'].append(f'Итоговый STL не прошёл проверку; откат стадии [{stage}] и повторная запись.')
+            if stage == 'simplification':
+                from .reduction import reason_text
+                reason_code = 'export_validation_failed'
+                report['simplification'].update(accepted=False, after=restored['triangles'], reason=reason_code,
+                                                 reason_ru=reason_text(reason_code))
+            elif stage == 'small_shells':
+                report['removed_geometry'] = [x for x in report.get('removed_geometry', []) if x['stage'] != stage]
+                report['removed_shells'] = [x for x in report['removed_geometry'] if x['reason'] == 'small_shell']
+            elif stage == 'cavities':
+                report['removed_cavities'] = []
+                report['removed_geometry'] = [x for x in report.get('removed_geometry', []) if x['stage'] != stage]
+            elif stage == 'cleanup':
+                report['degenerate_cleanup'].update(accepted=False, reason='export_validation_failed')
+            elif stage == 'planar_finish':
+                report['planar_finish'].update(accepted=False, after=restored['triangles'],
+                                              reason='export_validation_failed')
     report['after'] = final_info
     report['final_roundtrips'] = len(roundtrips)
-    report['steps'].append({'name': 'Запись и повторная проверка итогового STL', 'elapsed_seconds': time.monotonic()-t})
+    report['steps'].append({'name': 'Передача проверенной сетки' if array_output else 'Запись и повторная проверка итогового STL',
+                           'elapsed_seconds': time.monotonic()-t})
     from .deviation import source_deviation
     map_tmp = folder/'deviation.npz'
     report['source_deviation'] = source_deviation(reference, exported, mm, settings.quality_mm,
-        map_tmp, report['acceleration'], tracker.callback(98, 99, 'Карта отклонения от исходника'), emit)
+        map_tmp, report['acceleration'], tracker.callback(98, 99, 'Карта отклонения от исходника'), emit,
+        removed_regions=report.get('removed_geometry', []))
     report['source_deviation']['heatmap_file'] = str(map_tmp)
     from .planes import triangle_distribution
     tracker.update(99, 'Где остались треугольники')
     report['triangle_distribution'] = triangle_distribution(reference, exported, mm, settings.quality_mm)
     deviation = report['source_deviation']['max_deviation_mm']
-    if not math.isfinite(deviation) or deviation > 2*settings.quality_mm:
-        report['warnings'].append(f'Отклонение вершин исходника от результата {deviation:.6g} мм больше двух шагов ({2*settings.quality_mm:g} мм). Проверьте места ремонта.')
+    if not math.isfinite(deviation) or deviation > settings.quality_mm:
+        report['warnings'].append(f'Измеренное отклонение исходника {deviation:.6g} мм превышает шаг '
+            f'{settings.quality_mm:g} мм. Шаг вокселя не является общим пределом отклонения ремонта. '
+            'Проверьте карту отклонений. [source_deviation_above_quality]')
     from .inspection import shell_summary
     summary, report['shells'] = shell_summary(exported, mm)
     report['after'].update(summary)
     count = report['after']['components']
     if count > 1:
         report['warnings'].append(f'В файле {count} замкнутых оболочек. Раздельные детали сохранены; перемычки не добавлялись.')
-    report.update(status='repaired' if count == 1 else 'repaired_multiple_shells', output=str(tmp),
-                  artifacts={'stl': str(tmp), 'deviation': str(map_tmp)}, work_directory=str(folder),
-                  elapsed_seconds=time.monotonic()-started)
+    artifacts = {'stl': str(tmp)} if array_output is None else {
+        'vertices': str(array_output[0]), 'faces': str(array_output[1])}
+    artifacts['deviation'] = str(map_tmp)
+    status = 'repaired' if count == 1 else 'repaired_multiple_shells'
+    if report.get('simplification', {}).get('requested') and not report['simplification']['accepted'] \
+            and not report.get('planar_finish', {}).get('accepted'):
+        status = 'repaired_without_simplification'
+        report['warnings'].append(f"Сетка исправлена, но упрощение отклонено: сохранено {final_info['triangles']:,} граней. "
+                                   '[simplification_not_accepted]')
+    report.update(status=status, output=str(tmp if array_output is None else array_output[0]),
+                  artifacts=artifacts, work_directory=str(folder), elapsed_seconds=time.monotonic()-started)
     emit(f"Карта отклонения: {report['source_deviation']['elapsed_seconds']:.2f} с; "
          f"проекции={','.join(report['acceleration'].get('projection_backends', []))}.")
     tracker.update(100, 'Готово')

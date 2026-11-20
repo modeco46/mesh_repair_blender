@@ -8,6 +8,7 @@ import os
 import ctypes
 import numpy as np
 from .compute import Projector, cpu_count
+from .components import component_labels
 
 
 def prepare_reduction(mesh, mm):
@@ -17,8 +18,7 @@ def prepare_reduction(mesh, mm):
     candidate.pack()
     # Parallel decimation must not even receive the tiny shells. bdVerts alone
     # did not reliably preserve them in the pinned SDK's partitioned path.
-    mapping, count = mm.MeshComponents.getAllComponentsMap(mm.MeshPart(candidate))
-    groups = np.fromiter((int(x) for x in mapping), dtype=np.int32, count=mapping.size())
+    groups, count = component_labels(candidate, mm)
     sizes = np.bincount(groups, minlength=count)
     small = mn.faceBitSetFromBools(sizes[groups] < 50)
     protected_count = int(np.count_nonzero(sizes < 50))
@@ -30,8 +30,55 @@ def prepare_reduction(mesh, mm):
     return {'candidate': candidate, 'protected': protected, 'protected_count': protected_count}
 
 
+def planar_opportunity(mesh, mm, settings):
+    """Cheap heuristic on the CURRENT mesh, not source normal-cluster roughness.
+
+    Estimate endpoint collapses with a per-vertex plane-error matrix. A whole
+    one-ring flatness test misses short edges near curved poles and straight
+    ridges, so it cannot safely predict useful decimation opportunities.
+    This only decides whether to spend time on optional decimation; it never
+    validates geometry. Small/very large inputs bypass the heuristic.
+    """
+    from meshlib import mrmeshnumpy as mn
+    count = mesh.topology.numValidFaces()
+    if settings.planar_finish_always or count < 1000 or count > 1_000_000:
+        return {'run': True, 'reason': 'forced_or_outside_screen_size'}
+    faces = mn.getNumpyFaces(mesh.topology)
+    vertices = mn.getNumpyVerts(mesh).astype(np.float64)
+    # Unpacked inputs need a conservative fallback, not invalid -1 face indices.
+    if len(faces) != count or np.any(faces < 0):
+        return {'run': True, 'reason': 'unpacked_mesh'}
+    tri = vertices[faces]
+    normals = np.cross(tri[:, 1]-tri[:, 0], tri[:, 2]-tri[:, 0])
+    lengths = np.linalg.norm(normals, axis=1)
+    normals /= np.maximum(lengths[:, None], np.finfo(float).tiny)
+    matrices = np.zeros((len(vertices), 3, 3))
+    face_matrices = normals[:, :, None]*normals[:, None, :]
+    for corner in range(3):
+        np.add.at(matrices, faces[:, corner], face_matrices)
+    degree = np.bincount(faces.ravel(), minlength=len(vertices))
+    matrices /= np.maximum(degree[:, None, None], 1)
+    eligible = np.zeros(len(vertices), dtype=bool)
+    # Deliberately generous screening: exact QEM/feature protection decides the
+    # result later. This is an optional speed/triangle-count tradeoff only.
+    limit = (settings.quality_mm*.002)**2
+    for corner in range(3):
+        a, b = faces[:, corner], faces[:, (corner+1) % 3]
+        delta = vertices[b]-vertices[a]
+        for ids in (a, b):
+            error = np.einsum('ni,nij,nj->n', delta, matrices[ids], delta)
+            eligible[ids[error <= limit]] = True
+    first, second = crease_endpoints(faces, normals, len(vertices), settings.coplanar_angle_deg)
+    eligible &= ~crease_corner_mask(vertices, first, second)
+    fraction = min(1., 2*int(eligible.sum())/count)
+    return {'run': fraction >= .03, 'method': 'current_edge_plane_error_heuristic',
+            'potential_removable_vertices': int(eligible.sum()), 'estimated_reduction_fraction': fraction,
+            'minimum_fraction': .03, 'screen_error_mm': settings.quality_mm*.002,
+            'prediction_is_bound': False}
+
+
 def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve_planar_corners=False,
-                      checkpoint=None, prepared=None):
+                      checkpoint=None, prepared=None, protection_points=None):
     from meshlib import mrmeshnumpy as mn
     prepared = prepare_reduction(mesh, mm) if prepared is None else prepared
     if prepared['candidate'] is None:
@@ -39,6 +86,7 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve
     candidate = mm.Mesh(prepared['candidate'])
     protected, protected_count = prepared['protected'], prepared['protected_count']
     stages = []
+    locked = None
     requested = []
     # A general QEM pass already reduces planar faces. Running a separate
     # planar pass first resets the metric and spends the error budget twice.
@@ -48,7 +96,12 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve
         requested.append(('coplanar', settings.coplanar_angle_deg))
     for index, (kind, angle) in enumerate(requested):
         before = candidate.topology.numValidFaces()
-        candidate.packOptimally(False)
+        from .hotspots import protected_vertices, remap_locked_vertices
+        if locked is None and protection_points is not None:
+            locked = protected_vertices(candidate, protection_points, mm)
+        packing = candidate.packOptimally(False)
+        if locked is not None:
+            locked = remap_locked_vertices(locked, packing, mm)
         params = mm.DecimateSettings()
         # The SDK's maxError is an estimate. Acceptance is decided by the
         # independent distance check on the candidate in memory.
@@ -63,12 +116,15 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve
         params.touchBdVerts = False
         params.touchNearBdEdges = True
         params.bdVerts = candidate.topology.findBdVerts()
+        if locked is not None:
+            params.bdVerts |= locked
+            params.region = candidate.topology.getValidFaces()-mm.getIncidentFaces(candidate.topology, locked)
         if kind == 'coplanar':
             creases = mm.findCreaseEdges(candidate.topology, candidate.points,
                                         max(math.radians(angle), 1e-7))
             # Keep junctions/corners, but allow collinear ridge vertices to
             # disappear. Locking every crease vertex leaves a dense seam belt.
-            params.bdVerts |= crease_corners(candidate, creases, mm, mn)
+            params.bdVerts |= crease_corners(candidate, creases, mm, mn, angle_deg=angle)
             params.notFlippable = creases
             params.collapseNearNotFlippable = True
         preserve_reduced_corners = (preserve_planar_corners and kind == 'curved' and index > 0 and
@@ -80,13 +136,13 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve
             # The caller enables this for surface repairs only; voxel seam
             # vertices must remain free to remove reconstruction artifacts.
             creases = mm.findCreaseEdges(candidate.topology, candidate.points, math.radians(45))
-            params.bdVerts |= crease_corners(candidate, creases, mm, mn)
+            params.bdVerts |= crease_corners(candidate, creases, mm, mn, angle_deg=45)
         # General simplification is controlled by the distance to the complete
         # repaired surface, not by locking voxel-generated normal discontinuities.
-        # Partitioned decimation locks the partition seams: with crease protection a perfect 6.3M-triangle cube
-        # ended with 252 instead of 12 triangles. The general (curved) pass is not affected (40 vs 34), so only
-        # the planar pass runs unpartitioned.
-        params.subdivideParts = 1 if kind == 'coplanar' else \
+        # Partitioning locks seams and can leave extra planar triangles. Keep
+        # the exact unpartitioned finish for <=2M faces, and trade those seams
+        # for native parallelism on very large surfaces.
+        params.subdivideParts = 1 if kind == 'coplanar' and before <= 2_000_000 else \
             min(os.cpu_count() or 1, cpu_count(), max(1, before // 25_000))
         start, end = 78 + 7 * index / len(requested), 78 + 7 * (index + 1) / len(requested)
         stage = 'Схлопывание плоских участков' if kind == 'coplanar' else 'Упрощение всей поверхности в пределах допуска'
@@ -103,6 +159,8 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve
         stages.append({'kind': kind, 'angle_deg': angle, 'before': before,
                        'after': candidate.topology.numValidFaces(),
                        'pass': index + 1, 'error_scale': error_scale,
+                       'protected_hotspot_vertices': locked.count() if locked is not None else 0,
+                       'subdivide_parts': params.subdivideParts,
                        'preserved_reduced_corners': preserve_reduced_corners,
                        'after_with_protected': candidate.topology.numValidFaces() + (protected.topology.numValidFaces() if protected is not None else 0),
                        'native_error_estimate_mm': float(result.errorIntroduced),
@@ -115,8 +173,16 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve
             if protected is not None:
                 snapshot.addMesh(protected)
             snapshot.pack()
-            if not checkpoint(snapshot, list(stages)):
+            response = checkpoint(snapshot, list(stages))
+            if response is False:
                 break
+            if isinstance(response, mm.Mesh):
+                # Continue subsequent QEM passes from a repaired single-shell
+                # checkpoint, not from the rejected pre-repair geometry.
+                if protected is not None:
+                    raise RuntimeError('A repaired checkpoint cannot include protected shells.')
+                candidate = mm.Mesh(response)
+                locked = None
         if candidate.topology.numValidFaces() > before * .97:
             stages[-1]['stop_reason'] = 'removed_less_than_three_percent'
             break
@@ -127,7 +193,28 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve
 
 
 
-def crease_corners(mesh, creases, mm, mn):
+def crease_endpoints(faces, normals, vertex_count, angle_deg):
+    from .orientation import edge_pairs
+    count = len(faces)
+    x, y, _, _, _ = edge_pairs(faces, vertex_count)
+    dot = np.einsum('ij,ij->i', normals[x % count], normals[y % count])
+    x = x[dot < math.cos(max(math.radians(angle_deg), 1e-7))]
+    return faces[x % count, x//count], faces[x % count, (x//count+1) % 3]
+
+
+def crease_corner_mask(verts, first, second):
+    delta = verts[second].astype(float)-verts[first]
+    length = np.linalg.norm(delta, axis=1)
+    direction = delta/np.maximum(length[:, None], np.finfo(float).tiny)
+    degree = np.bincount(np.r_[first, second], minlength=len(verts))
+    directions = np.zeros((len(verts), 3))
+    np.add.at(directions, first, direction)
+    np.add.at(directions, second, -direction)
+    turn = np.linalg.norm(directions, axis=1)
+    return (degree > 0) & ((degree != 2) | (turn > 2*math.sin(math.radians(1)/2)))
+
+
+def crease_corners(mesh, creases, mm, mn, *, angle_deg=None):
     """Freeze only branch/end/corner vertices of crease chains.
 
     On a straight ridge a degree-two vertex can be removed. At a real corner
@@ -137,20 +224,26 @@ def crease_corners(mesh, creases, mm, mn):
     verts = mn.getNumpyVerts(mesh)
     if not creases.count():
         return mm.VertBitSet()
-    edges = np.fromiter((int(e)*2 for e in creases), dtype=np.int32, count=creases.count())
-    first = np.fromiter((int(mesh.topology.org(mm.EdgeId(int(e)))) for e in edges), dtype=np.int32, count=len(edges))
-    second = np.fromiter((int(mesh.topology.dest(mm.EdgeId(int(e)))) for e in edges), dtype=np.int32, count=len(edges))
-    delta = verts[second].astype(float)-verts[first]
-    length = np.linalg.norm(delta,axis=1)
-    direction = delta/np.maximum(length[:,None],np.finfo(float).tiny)
-    degree = np.bincount(np.r_[first,second],minlength=len(verts))
-    directions = np.zeros((len(verts),3))
-    np.add.at(directions,first,direction)
-    np.add.at(directions,second,-direction)
+    if angle_deg is None:
+        edges = np.fromiter((int(e)*2 for e in creases), dtype=np.int32, count=creases.count())
+        first = np.fromiter((int(mesh.topology.org(mm.EdgeId(int(e)))) for e in edges), dtype=np.int32, count=len(edges))
+        second = np.fromiter((int(mesh.topology.dest(mm.EdgeId(int(e)))) for e in edges), dtype=np.int32, count=len(edges))
+    else:
+        # Bulk endpoints avoid two Python/native calls per crease edge.
+        faces = mn.getNumpyFaces(mesh.topology)
+        # Only faces incident to crease edges are needed; both neighbours of
+        # every crease are included. Do not allocate 9 doubles per planar face
+        # on a 17M-triangle reconstruction just to protect its sparse ridges.
+        incident = mn.getNumpyBitSet(mm.getIncidentFaces(mesh.topology, creases))
+        ids = np.flatnonzero(incident)
+        faces = faces[ids[ids < len(faces)]]
+        tri = verts[faces].astype(np.float64)
+        normals = np.cross(tri[:, 1]-tri[:, 0], tri[:, 2]-tri[:, 0])
+        normals /= np.maximum(np.linalg.norm(normals, axis=1)[:, None], np.finfo(float).tiny)
+        first, second = crease_endpoints(faces, normals, len(verts), angle_deg)
     # Only almost-collinear chains are relaxed here. Broader removal of voxel
     # stair-steps belongs to the tolerance-checked general simplification pass.
-    turn = np.linalg.norm(directions,axis=1)
-    pinned = (degree > 0) & ((degree != 2) | (turn > 2*math.sin(math.radians(1)/2)))
+    pinned = crease_corner_mask(verts, first, second)
     return mn.vertBitSetFromBools(pinned)
 
 def triangle_upper_bounds(triangles, targets):
@@ -440,7 +533,7 @@ class ProjectionLayoutError(ValueError):
 
 
 def propose_reduction_by_shell(mesh, mm, settings, progress, error_scale=1.0, *, preserve_planar_corners=False,
-                               min_faces=200):
+                               min_faces=200, protection_points=None):
     """Decimate every large shell on its own; shells below min_faces stay untouched.
 
     A whole-mesh pass can collapse a tiny shell or press two neighbouring shells into each other, and the caller
@@ -461,7 +554,7 @@ def propose_reduction_by_shell(mesh, mm, settings, progress, error_scale=1.0, *,
         if region.count() >= min_faces and scale >= 0.01:
             try:
                 reduced, stages = propose_reduction(part, mm, settings, progress, scale,
-                                                    preserve_planar_corners=preserve_planar_corners)
+                    preserve_planar_corners=preserve_planar_corners, protection_points=protection_points)
                 collisions = mm.findSelfCollidingTrianglesBS(mm.MeshPart(reduced)).count()
                 single = mm.MeshComponents.getNumComponents(mm.MeshPart(reduced)) == 1
                 if not (reduced.topology.isClosed() and single and not collisions and reduced.volume() > 0):
@@ -525,6 +618,7 @@ def measured_distance(reference, candidate, mm):
 
 
 REASONS = {
+    'self_intersections': 'После упрощения остались самопересечения; число указано в candidate.self_intersecting_faces.',
     'export_validation_failed': 'Итоговый STL не прошёл проверку; восстановлена предыдущая стадия из памяти.',
     'topology_changed': 'После упрощения появились дыры или самопересечения.',
     'kept_shell_count_changed': 'После упрощения изменилось число оболочек.',

@@ -5,21 +5,20 @@ from .compute import Projector
 from .reduction import projection_arrays
 
 
-def inside_flags(vertices, distances, target, mm, quality_mm, limit=400_000):
-    """True for source vertices that lie inside the solid of the result and deeper than the tolerance.
+def inside_flags(vertices, distances, target, mm, quality_mm):
+    """Classify all vertices beyond tolerance with native signed-distance batches."""
+    from meshlib import mrmeshnumpy as mn
 
-    Such vertices belong to internal or doubled source surfaces that a union or voxel repair removes on purpose,
-    so they are not a shape deviation. The sign comes from MeshLib's pseudo-normal signed distance, which stays
-    correct at concave edges (a nearest-triangle plane test does not). Only vertices farther than the tolerance
-    are tested; if there are more than `limit`, the farthest ones are tested and the rest stay counted."""
     flags = np.zeros(len(vertices), dtype=bool)
     candidates = np.flatnonzero(distances > quality_mm)
-    if len(candidates) > limit:
-        candidates = candidates[np.argsort(-distances[candidates], kind='stable')[:limit]]
-    for index in candidates:
-        value = target.signedDistance(mm.Vector3f(*(float(c) for c in vertices[index])))
-        if value is not None and value < 0:
-            flags[index] = True
+    for start in range(0, len(candidates), 65536):
+        indices = candidates[start:start + 65536]
+        points = mm.VertCoords(mn.fromNumpyArray(vertices[indices].astype(np.float32)))
+        signed = mm.findSignedDistances(target, points)
+        values = np.fromiter(signed.vec_, dtype=np.float32, count=len(indices))
+        if not np.isfinite(values).all():
+            raise RuntimeError('Не удалось определить знак отклонения вершин.')
+        flags[indices] = values < 0
     return flags
 
 
@@ -40,7 +39,7 @@ def source_deviation(source, target, mm, quality_mm, map_path, acceleration=None
             raise RuntimeError('Не удалось вычислить карту отклонения: отсутствует проекция на поверхность.')
         distances[start:start+len(squared)] = np.sqrt(np.maximum(squared, 0))
         progress((start+len(squared))/len(vertices))
-    threshold = 2*quality_mm
+    threshold = quality_mm
     inside = inside_flags(vertices, distances, target, mm, quality_mm)
     classified = True
     outer = np.where(inside, 0, distances).astype(np.float32)     # internal source vertices do not count
@@ -62,6 +61,8 @@ def source_deviation(source, target, mm, quality_mm, map_path, acceleration=None
             'interior_vertices': int(inside.sum()),
             'interior_max_deviation_mm': float(distances[inside].max()) if inside.any() else 0.0,
             'vertex_count': len(vertices), 'exceeding_vertices': int(np.count_nonzero(outer > threshold)),
+            'all_vertices_over_quality': int(np.count_nonzero(distances > quality_mm)),
+            'vertices_over_two_steps': int(np.count_nonzero(outer > 2*quality_mm)),
             'vertices_over_quality': int(np.count_nonzero(outer > quality_mm)),
             'top10': [{'vertex_id': int(i), 'coordinates_mm': vertices[i].tolist(),
                        'deviation_mm': float(outer[i])} for i in top],

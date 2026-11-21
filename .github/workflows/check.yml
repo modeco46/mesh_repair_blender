@@ -2,7 +2,7 @@ name: Check and build add-on
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'release/**']
   pull_request:
     branches: [main]
 
@@ -30,7 +30,7 @@ jobs:
         with:
           python-version: "3.13"
       - run: python scripts/build_release.py --target windows-x64
-      - run: python scripts/smoke_release.py dist/mesh-repair-blender-1.1.3-windows-x64.zip
+      - run: python scripts/smoke_release.py (Get-Item dist/*.zip).FullName
       - name: Check Blender 5.3 on Windows
         env:
           BLENDER_TEST_DIR: ${{ runner.temp }}/blender-test
@@ -44,14 +44,26 @@ jobs:
           Expand-Archive $archive $env:BLENDER_TEST_DIR
           $blender = Join-Path $env:BLENDER_TEST_DIR 'blender-5.3.0-windows-x64'
           $env:MESH_REPAIR_ADDON_ROOT = Join-Path $env:BLENDER_TEST_DIR 'addon'
-          Expand-Archive dist/mesh-repair-blender-1.1.3-windows-x64.zip $env:MESH_REPAIR_ADDON_ROOT
+          $zip = (Get-Item dist/*.zip).FullName
+          Expand-Archive $zip $env:MESH_REPAIR_ADDON_ROOT
           $env:MESH_REPAIR_PYTHON = Join-Path $blender '5.3/python/bin/python.exe'
           & "$blender/blender.exe" --background --factory-startup --python-exit-code 1 --python tests/blender_smoke.py
           if ($LASTEXITCODE -ne 0) { throw 'Blender smoke test failed' }
           & "$blender/blender.exe" --background --factory-startup --python-exit-code 1 --python tests/blender_ui_smoke.py
           if ($LASTEXITCODE -ne 0) { throw 'Blender UI smoke test failed' }
+          $env:BLENDER_USER_CONFIG = Join-Path $env:BLENDER_TEST_DIR 'user-config'
+          $env:BLENDER_USER_EXTENSIONS = Join-Path $env:BLENDER_TEST_DIR 'user-extensions'
+          $env:MESH_REPAIR_FIXTURE = Join-Path $env:BLENDER_TEST_DIR 'test.stl'
+          curl.exe -fL --retry 3 https://raw.githubusercontent.com/modeco46/MeshRepair/6ca780f183c91dc27da3e4f60c3034bbdcceae94/tests/data/test.stl -o $env:MESH_REPAIR_FIXTURE
+          if ($LASTEXITCODE -ne 0 -or (Get-FileHash $env:MESH_REPAIR_FIXTURE -Algorithm SHA256).Hash.ToLower() -ne 'a09019047b8a65a53f457bcc20c79a1dbc2857b705596d74b0ab095fd0ca1cb1') { throw 'Fixture download/checksum failed' }
+          Remove-Item Env:MESH_REPAIR_PYTHON
+          Remove-Item Env:MESH_REPAIR_ADDON_ROOT
+          & "$blender/blender.exe" --command extension install-file --repo user_default --enable $zip
+          if ($LASTEXITCODE -ne 0) { throw 'Extension installation failed' }
+          & "$blender/blender.exe" --background --python-exit-code 1 --python tests/blender_installed.py
+          if ($LASTEXITCODE -ne 0) { throw 'Installed extension repair failed' }
       - uses: actions/upload-artifact@v4
         with:
-          name: mesh-repair-blender-1.1.3-windows-x64
+          name: mesh-repair-blender-windows-x64
           path: dist/*.zip
           retention-days: 30

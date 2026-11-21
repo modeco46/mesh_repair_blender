@@ -16,12 +16,50 @@ def finite_vertices(verts):
         raise ValueError(f'В координатах сетки обнаружены NaN/inf: {count} вершин. Исправьте координаты в исходном файле.')
 
 
-def weld(verts, faces):
+def clean_triangles(verts, faces, *, keep_coincident_faces=False):
+    """Weld exact coordinates, then remove null and repeated triangles before building adjacency."""
     finite_vertices(verts)
     unique, inverse = np.unique(verts, axis=0, return_inverse=True)
     welded = inverse.reshape(-1)[faces].astype(np.int32)
-    keep = (welded[:, 0] != welded[:, 1]) & (welded[:, 1] != welded[:, 2]) & (welded[:, 0] != welded[:, 2])
-    return unique, welded[keep], int(np.count_nonzero(~keep))
+    keep = np.empty(len(welded), dtype=bool)
+    for start in range(0, len(welded), 65536):
+        block = slice(start, start + 65536)
+        tri = unique[welded[block]].astype(np.float64)
+        keep[block] = np.any(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]) != 0, axis=1)
+    degenerate = int(np.count_nonzero(~keep))
+    if degenerate:
+        welded = welded[keep]
+    if not len(welded):
+        raise ValueError('Все треугольники имеют нулевую площадь.')
+    duplicates = 0
+    if not keep_coincident_faces:
+        keys = np.sort(welded, axis=1).view(np.dtype((np.void, 3 * welded.itemsize))).ravel()
+        _, indices = np.unique(keys, return_index=True)
+        duplicates = len(welded) - len(indices)
+        if duplicates:
+            welded = welded[np.sort(indices)]  # Retain the original winding and ordering.
+    return unique, welded, degenerate, duplicates
+
+
+def is_flat_input(vertices, faces):
+    """Test represented geometry, using round-off only (independent of the voxel step)."""
+    # Pick a well-conditioned reference triangle. All inputs here are packed.
+    sample = faces[np.linspace(0, len(faces) - 1, min(32, len(faces)), dtype=np.intp)]
+    tri = vertices[sample].astype(np.float64)
+    normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    lengths = np.linalg.norm(normals, axis=1)
+    index = int(np.argmax(lengths))
+    if not lengths[index]:
+        return False  # clean_triangles handles zero-area inputs.
+    normal = normals[index] / lengths[index]
+    origin = tri[index, 0]
+    for start in range(0, len(vertices), 65536):
+        delta = vertices[start:start + 65536].astype(np.float64) - origin
+        # Dot-product rounding bound; does not scale with absolute scene position.
+        rounding = 32 * np.finfo(float).eps * np.abs(delta).sum(axis=1)
+        if np.any(np.abs(np.einsum('ij,j->i', delta, normal)) > rounding):
+            return False
+    return True
 
 
 def edge_pairs(faces, nv):
@@ -110,11 +148,14 @@ def prepare_orientation(mesh, mm, progress=lambda value: None, weld_tolerance=0)
     verts, faces = mn.getNumpyVerts(mesh), mn.getNumpyFaces(mesh.topology)
     finite_vertices(verts)
     progress(.05)
-    verts, faces, degenerate = weld(verts, faces)
+    # Separate closed solids can share a complete interface. Removing just one
+    # side opens a solid; the Boolean stage owns such interfaces.
+    verts, faces, degenerate, duplicates = clean_triangles(
+        verts, faces, keep_coincident_faces=before > 1 and mesh.topology.isClosed())
     progress(.3)
     faces, report = orient_consistently(verts, faces)
     report.update(components_before=before, components_after=before,
-                  removed_degenerate_faces=degenerate, approximate_weld_mm=weld_tolerance)
+                  removed_degenerate_faces=0, removed_duplicate_faces=0, approximate_weld_mm=weld_tolerance)
     progress(.7)
     if report['accepted']:
         settings = mm.MeshBuilder.BuildSettings()
@@ -125,13 +166,17 @@ def prepare_orientation(mesh, mm, progress=lambda value: None, weld_tolerance=0)
             report.update(accepted=False, reason='orientation_rebuild_dropped_faces')
         else:
             after = mm.MeshComponents.getNumComponents(mm.MeshPart(candidate))
-            if after < before or report['disoriented_edges'] or report['negative_closed_components'] or degenerate or (candidate.topology.isClosed() and not mesh.topology.isClosed()):
+            if after < before or report['disoriented_edges'] or report['negative_closed_components'] or degenerate or duplicates or (candidate.topology.isClosed() and not mesh.topology.isClosed()):
                 mesh = candidate
+                mesh.pack()
+                report.update(removed_degenerate_faces=degenerate, removed_duplicate_faces=duplicates)
             if weld_tolerance:
                 count_before = mesh.topology.numValidFaces()
-                mm.uniteCloseVertices(mesh, weld_tolerance)
-                mesh, followup = prepare_orientation(mesh, mm)
-                report['approximate_weld_followup'] = followup
+                united = mm.uniteCloseVertices(mesh, weld_tolerance)
+                report['approximate_weld_united_vertices'] = united
+                if united:
+                    mesh, followup = prepare_orientation(mesh, mm)
+                    report['approximate_weld_followup'] = followup
                 report['approximate_weld_removed_faces'] = count_before-mesh.topology.numValidFaces()
             report['components_after'] = mm.MeshComponents.getNumComponents(mm.MeshPart(mesh))
             report['closed_after'] = mesh.topology.isClosed()

@@ -1,8 +1,7 @@
 """Fast Blender <-> MeshRepair geometry transfer without UI operators.
 
-The worker consumes binary STL because this keeps the proven MeshRepair engine
-unchanged.  Results return as two uncompressed NPY arrays, avoiding a second
-STL de-duplication pass on Blender's main thread.
+The worker consumes binary STL and returns the validated indexed mesh as two
+uncompressed NPY arrays. A result vertex is identified by its index.
 """
 from __future__ import annotations
 
@@ -117,7 +116,9 @@ def create_mesh_object(context, vertices_path, faces_path, name: str, mm_per_uni
     mesh.polygons.foreach_set("loop_total", np.full(len(faces), 3, dtype=np.int32))
     mesh.polygons.foreach_set("use_smooth", np.zeros(len(faces), dtype=np.bool_))
     mesh.update(calc_edges=True)
-    mesh.validate(clean_customdata=False)
+    if mesh.validate(clean_customdata=False):
+        bpy.data.meshes.remove(mesh)
+        raise ValueError("Blender изменил геометрию при проверке импортированной сетки.")
     result = bpy.data.objects.new(name, mesh)
     context.collection.objects.link(result)
     for obj in context.selected_objects:

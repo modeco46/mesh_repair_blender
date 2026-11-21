@@ -6,16 +6,26 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   release:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - run: python scripts/build_release.py --target windows-x64
+      - name: Use the Windows ZIP tested in Blender for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $sha = git rev-parse HEAD
+          $run = gh run list --workflow check.yml --commit $sha --event push --status success --limit 1 --json databaseId --jq '.[0].databaseId'
+          if (-not $run) { throw 'No successful Windows package check for this commit' }
+          gh run download $run --name mesh-repair-blender-windows-x64 --dir dist
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download the checked ZIP' }
+          $name = 'mesh-repair-blender-' + $env:GITHUB_REF_NAME.Substring(1) + '-windows-x64.zip'
+          if (-not (Test-Path (Join-Path dist $name))) { throw 'Tag and checked package version do not match' }
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*.zip
+          prerelease: ${{ github.ref_name == 'v1.4.0' }}
+          make_latest: ${{ github.ref_name != 'v1.4.0' }}

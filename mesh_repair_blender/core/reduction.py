@@ -18,6 +18,10 @@ def prepare_reduction(mesh, mm):
     # Parallel decimation must not even receive the tiny shells. bdVerts alone
     # did not reliably preserve them in the pinned SDK's partitioned path.
     mapping, count = mm.MeshComponents.getAllComponentsMap(mm.MeshPart(candidate))
+    if count == 1:
+        small = candidate.topology.numValidFaces() < 50
+        return {'candidate': None if small else candidate, 'protected': candidate if small else None,
+                'protected_count': int(small)}
     groups = np.fromiter((int(x) for x in mapping), dtype=np.int32, count=mapping.size())
     sizes = np.bincount(groups, minlength=count)
     small = mn.faceBitSetFromBools(sizes[groups] < 50)
@@ -31,7 +35,7 @@ def prepare_reduction(mesh, mm):
 
 
 def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve_planar_corners=False,
-                      checkpoint=None, prepared=None):
+                      checkpoint=None, prepared=None, endpoint_only=False):
     from meshlib import mrmeshnumpy as mn
     prepared = prepare_reduction(mesh, mm) if prepared is None else prepared
     if prepared['candidate'] is None:
@@ -55,7 +59,7 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve
         params.maxError = settings.quality_mm * error_scale
         params.maxAngleChange = -1  # this property controls edge FLIPS, not coplanarity
         params.tinyEdgeLength = 0
-        params.optimizeVertexPos = kind != 'coplanar'
+        params.optimizeVertexPos = kind != 'coplanar' and not endpoint_only
         # Angle weighting reduces artificial dependence of QEM on local
         # triangulation density (in particular the dense voxel seam bands).
         params.angleWeightedDistToPlane = True
@@ -103,6 +107,7 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve
         stages.append({'kind': kind, 'angle_deg': angle, 'before': before,
                        'after': candidate.topology.numValidFaces(),
                        'pass': index + 1, 'error_scale': error_scale,
+                       'vertex_placement': 'optimal' if params.optimizeVertexPos else 'existing_endpoint',
                        'preserved_reduced_corners': preserve_reduced_corners,
                        'after_with_protected': candidate.topology.numValidFaces() + (protected.topology.numValidFaces() if protected is not None else 0),
                        'native_error_estimate_mm': float(result.errorIntroduced),
@@ -525,6 +530,9 @@ def measured_distance(reference, candidate, mm):
 
 
 REASONS = {
+    'self_intersections': 'После упрощения остались пересекающиеся грани.',
+    'volume_changed': 'Упрощение меняет объём исправленного тела более чем на 2%.',
+    'genus_changed': 'После упрощения изменилось число сквозных отверстий.',
     'export_validation_failed': 'Итоговый STL не прошёл проверку; восстановлена предыдущая стадия из памяти.',
     'topology_changed': 'После упрощения появились дыры или самопересечения.',
     'kept_shell_count_changed': 'После упрощения изменилось число оболочек.',

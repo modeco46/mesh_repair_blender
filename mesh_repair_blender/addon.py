@@ -8,6 +8,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
+import time
 import uuid
 
 import bpy
@@ -16,7 +18,7 @@ from bpy.types import Operator, Panel, PropertyGroup
 from bpy_extras.io_utils import ExportHelper
 
 from .bridge import create_mesh_object, write_selected_stl
-from . import heatmap
+from . import bl_info, heatmap
 
 
 _ACTIVE = None
@@ -164,6 +166,7 @@ def _read_progress(job, runtime):
             continue
         if event.get("type") == "progress":
             value = event.get("value", {})
+            job["last_worker_progress"] = value
             runtime.progress = max(runtime.progress, int(value.get("percent", 0)))
             runtime.stage = str(value.get("stage", runtime.stage))
         elif event.get("type") == "log":
@@ -171,6 +174,7 @@ def _read_progress(job, runtime):
 
 
 def _store_report(name, report):
+    report['blender_addon_version'] = '.'.join(map(str, bl_info['version']))
     base = f"MeshRepair Report - {name}"
     text = bpy.data.texts.new(base)
     text.write(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False))
@@ -201,11 +205,21 @@ def _finish_job(context, job):
     _read_progress(job, runtime)
     job["log_stream"].close()
     result = None
+    report = None
     retain_job = False
     try:
         if job["result_file"].is_file():
             result = json.loads(job["result_file"].read_text(encoding="utf-8"))
         if job.get("cancelled"):
+            # The panel can already say Stop; retain the actual worker stage.
+            cancelled = {
+                "status": "cancelled", "operation": job["operation"],
+                "settings": json.loads(job["settings"].read_text(encoding="utf-8")),
+                "blender_source_objects": job["source_names"], "blender_mm_per_unit": job["mm_per_unit"],
+                "elapsed_seconds": time.monotonic() - job["started"],
+                "last_progress": job.get("last_worker_progress"), "last_log": runtime.last_log,
+            }
+            runtime.report_text = _store_report(job["result_name"], cancelled).name
             runtime.stage = "Остановлено"
             runtime.message = "Расчёт остановлен пользователем."
             return
@@ -237,7 +251,6 @@ def _finish_job(context, job):
             heatmap.show(context, target)
             runtime.progress, runtime.stage = 100, "Карта отклонений"
             return
-        report = None
         if result.get("report") and Path(result["report"]).is_file():
             report = json.loads(Path(result["report"]).read_text(encoding="utf-8"))
             report["blender_source_objects"] = job["source_names"]
@@ -280,6 +293,11 @@ def _finish_job(context, job):
     except Exception as exc:
         runtime.stage = "Ошибка импорта"
         runtime.message = str(exc)
+        if report is not None and runtime.report_text:
+            report.update(status="import_error", error=str(exc))
+            text = bpy.data.texts[runtime.report_text]
+            text.clear()
+            text.write(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False))
     finally:
         runtime.busy = False
         if job.get("timer") is not None:
@@ -303,6 +321,7 @@ def _begin(context, operation, operator, force_no_sharp=False):
     runtime.stage = "Подготовка геометрии"
     runtime.message = ""
     runtime.last_log = ""
+    runtime.last_log = ""
     runtime.retry_available = False
     if operation != "heatmap":
         runtime.has_result = False
@@ -316,6 +335,7 @@ def _begin(context, operation, operator, force_no_sharp=False):
         directory = Path(tempfile.mkdtemp(prefix="meshrepair-blender-", dir=parent))
         job = {
             "id": uuid.uuid4().hex,
+            "started": time.monotonic(),
             "operation": operation,
             "directory": directory,
             "source": directory / "source.stl",
@@ -525,11 +545,7 @@ class MESH_REPAIR_OT_details(Operator):
 
 
 def _stage_label(runtime):
-    if not runtime.busy:
-        return "Ошибка" if runtime.stage.startswith("Ошибка") else runtime.stage
-    if runtime.operation == "heatmap":
-        return "Карта отклонений"
-    return "Проверка…" if runtime.operation == "check" else "Исправление…"
+    return "Ошибка" if runtime.stage.startswith("Ошибка") else runtime.stage
 
 
 def _metric(layout, label, value):
@@ -557,9 +573,13 @@ class MESHREPAIR_PT_panel(Panel):
         layout.operator("mesh_repair.check_selected", icon="VIEWZOOM")
         box = layout.box()
         _metric(box, "Выбрано", selected)
-        box.label(text=_stage_label(runtime))
+        width = getattr(context.region, "width", 220) / max(1., context.preferences.system.ui_scale)
+        for line in textwrap.wrap(_stage_label(runtime), width=max(12, int((width - 30) / 7))):
+            box.label(text=line)
         if runtime.busy:
-            box.progress(factor=runtime.progress / 100, type="BAR", text=f"{runtime.progress}%")
+            elapsed = int(time.monotonic() - _ACTIVE["started"]) if _ACTIVE else 0
+            box.progress(factor=runtime.progress / 100, type="BAR",
+                         text=f"{runtime.progress}%   {elapsed//60}:{elapsed%60:02}")
             box.operator("mesh_repair.stop", icon="CANCEL")
         if runtime.has_result:
             _metric(box, "Грани до", f"{runtime.triangles_before:,}")

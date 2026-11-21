@@ -113,7 +113,7 @@ def report_html(report):
             line(f"Вершин исходника внутри тела результата (внутренние поверхности, не считаются отклонением): "
                  f"{fmt(deviation['interior_vertices'])}, до {fmt(deviation['interior_max_deviation_mm'])} мм.")
         if deviation.get('top10'):
-            line(f"Вершин с отклонением > двух шагов: {deviation.get('exceeding_vertices', 0)}. Кнопка «Отклонения» показывает карту в 3D.", 'warning' if deviation.get('exceeding_vertices') else '')
+            line(f"Вершин с отклонением > {fmt(deviation['warning_threshold_mm'])} мм: {deviation.get('exceeding_vertices', 0)}. Кнопка «Отклонения» показывает карту в 3D.", 'warning' if deviation.get('exceeding_vertices') else '')
             line('Наибольшие отклонения — координаты исходника в мм:')
             for spot in deviation['top10']:
                 xyz = ', '.join(fmt(v) for v in spot['coordinates_mm'])

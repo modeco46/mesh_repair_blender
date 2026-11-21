@@ -33,22 +33,30 @@ def basic_info(mesh, mm):
             'closed': mesh.topology.isClosed(), 'dimensions_mm': [size.x, size.y, size.z]}
 
 
-def shell_summary(mesh, mm):
+def shell_summary(mesh, mm, *, component_count=None):
     from meshlib import mrmeshnumpy as mn
     mesh.pack()
-    mapping, count = mm.MeshComponents.getAllComponentsMap(mm.MeshPart(mesh))
-    groups = np.fromiter((int(x) for x in mapping), dtype=np.int32, count=mapping.size())
-    sizes = np.bincount(groups, minlength=count)
+    count = component_count
+    if count != 1:
+        mapping, count = mm.MeshComponents.getAllComponentsMap(mm.MeshPart(mesh))
     boundary = mesh.topology.findLeftBdEdges()
-    adjacent = np.fromiter((int(mesh.topology.right(e)) for e in boundary), dtype=np.int32, count=boundary.count())
-    open_edges = np.bincount(groups[adjacent], minlength=count)
     minimum, maximum = np.full((count, 3), np.inf), np.full((count, 3), -np.inf)
-    verts, faces = mn.getNumpyVerts(mesh), mn.getNumpyFaces(mesh.topology)
-    for start in range(0, len(faces), 131072):
-        sl = slice(start, start+131072)
-        tri = verts[faces[sl]]
-        np.minimum.at(minimum, groups[sl], tri.min(axis=1))
-        np.maximum.at(maximum, groups[sl], tri.max(axis=1))
+    if count == 1:
+        sizes = np.array([mesh.topology.numValidFaces()])
+        open_edges = np.array([boundary.count()])
+        box = mesh.computeBoundingBox()
+        minimum[0], maximum[0] = list(box.min), list(box.max)
+    else:
+        groups = np.fromiter((int(x) for x in mapping), dtype=np.int32, count=mapping.size())
+        sizes = np.bincount(groups, minlength=count)
+        adjacent = np.fromiter((int(mesh.topology.right(e)) for e in boundary), dtype=np.int32, count=boundary.count())
+        open_edges = np.bincount(groups[adjacent], minlength=count)
+        verts, faces = mn.getNumpyVerts(mesh), mn.getNumpyFaces(mesh.topology)
+        for start in range(0, len(faces), 131072):
+            sl = slice(start, start+131072)
+            tri = verts[faces[sl]]
+            np.minimum.at(minimum, groups[sl], tri.min(axis=1))
+            np.maximum.at(maximum, groups[sl], tri.max(axis=1))
     order = np.argsort(-sizes)[:2000]
     largest = int(np.argmax(sizes))
     shells = [{'id': int(i)+1, 'triangles': int(sizes[i]), 'closed': bool(open_edges[i] == 0),
@@ -68,7 +76,7 @@ def describe_mesh(mesh, mm, callback=None):
     info.update(basic_info(mesh, mm))
     info['area_mm2'] = mesh.area()
     info['degenerate_faces'] = mm.findDegenerateFaces(mm.MeshPart(mesh)).count()
-    summary, shells = shell_summary(mesh, mm)
+    summary, shells = shell_summary(mesh, mm, component_count=info['components'])
     info.update(summary)
     return info, shells
 

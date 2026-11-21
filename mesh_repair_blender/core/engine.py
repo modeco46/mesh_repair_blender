@@ -400,11 +400,21 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
         emit(message)
     report['voxel_passes'] = []
     large_source = (mesh.topology.numValidFaces() >= DENSE_MESH_FACES or 'dense_routing' in report)
-    if (large_source and not settings.restore_sharp_edges and mesh.topology.isClosed() and
+    # Two triangles per voxel-sized surface square already make a dense
+    # isosurface even when the damaged input itself has only tens of thousands.
+    dense_surface = large_source or 2*estimate >= DENSE_MESH_FACES
+    if (dense_surface and not settings.restore_sharp_edges and mesh.topology.isClosed() and
             mm.MeshComponents.getNumComponents(mm.MeshPart(mesh)) == 1):
-        direct = try_closed_level_set(mesh, mm, settings, tracker, report, emit, translation)
-        if direct is not None:
-            return direct
+        checked = report.get('after_hole_filling', {})
+        crossing = checked.get('has_self_intersection')
+        if crossing is None:
+            count = checked.get('self_intersecting_faces')
+            crossing = count > 0 if count is not None else mm.findSelfCollidingTriangles(
+                mm.MeshPart(mesh), outCollidingPairs=None)
+        if crossing:
+            direct = try_closed_level_set(mesh, mm, settings, tracker, report, emit, translation)
+            if direct is not None:
+                return direct
     winding = None
     try:
         cuda = None if settings.disable_cuda else cuda_module()

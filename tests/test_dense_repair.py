@@ -1,6 +1,7 @@
 """Exercise the large-mesh decisions at small scale as well as the Windows Blender fixture."""
 import pytest
-from meshlib import mrmeshpy as mm
+import numpy as np
+from meshlib import mrmeshpy as mm, mrmeshnumpy as mn
 
 from mesh_repair_blender.core import engine, reduction
 from mesh_repair_blender.core.engine import Progress, Settings, diagnostics, valid
@@ -55,7 +56,7 @@ def test_misplaced_closed_level_set_falls_back_at_same_step(monkeypatch):
             result.transform(mm.AffineXf3f.translation(mm.Vector3f(1, 0, 0)))
         return result
     monkeypatch.setattr(mm, 'doubleOffsetMesh', shifted)
-    report = {'warnings': []}
+    report = {'warnings': [], 'after_hole_filling': {'self_intersecting_faces': 2}}
     translation = mm.Vector3f(3, 4, 5)
     result = engine.sparse_repair(mesh, mm, Settings(.08, restore_sharp_edges=False, disable_cuda=True),
                                   Progress(lambda _: None), report, lambda _: None, translation)
@@ -132,3 +133,31 @@ def test_dense_refinement_cannot_spend_the_voxel_error_twice(monkeypatch):
     assert compact['verification']['max_deviation_mm'] < .019
     assert compact['reason'] == 'level_set_distance_exceeds_step'
     assert not compact['level_set_source_check']['within_step']
+
+
+def test_dense_voxel_estimate_can_select_the_band_for_a_small_input(monkeypatch):
+    monkeypatch.setattr(engine, 'DENSE_MESH_FACES', 1500)
+    sphere = mm.makeUVSphere(1, 24, 24)
+    verts = mn.getNumpyVerts(sphere)
+    verts[np.argmax(verts[:, 0])] += [0, .6, 0]
+    mesh = mn.meshFromFacesVerts(mn.getNumpyFaces(sphere.topology), verts)
+    report = {'warnings': []}
+    engine.sparse_repair(mesh, mm, Settings(.08, restore_sharp_edges=False, disable_cuda=True),
+                         Progress(lambda _: None), report, lambda _: None)
+    assert mesh.topology.numValidFaces() < 1500
+    assert report['voxel_passes'][0]['backend'] == 'openvdb_closed_level_set'
+    assert valid(report['reconstruction_validation'])
+
+
+def test_inward_open_body_is_reoriented_after_closing(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, 'DENSE_MESH_FACES', 10)
+    mesh = cube()
+    mesh.topology.flipOrientation()
+    mesh.topology.deleteFace(mm.FaceId(0))
+    path = tmp_path/'inside-out.stl'
+    mm.saveMesh(mesh, path)
+    report = engine.run(path, settings=Settings(.02, restore_sharp_edges=False), work_dir=tmp_path/'job',
+                        array_output=(tmp_path/'v.npy', tmp_path/'f.npy'))
+    assert report['hole_filling']['closed_orientation_corrections'] == 1
+    assert report['algorithm'] == 'surface_repair' and 'voxel_passes' not in report
+    assert report['after']['signed_volume_mm3'] == pytest.approx(1)

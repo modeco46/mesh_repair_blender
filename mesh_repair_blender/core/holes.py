@@ -217,8 +217,13 @@ def fill_simple_holes(mesh, mm, quality_mm, progress=lambda value: None, emit=la
         if not item.get('accepted'):
             report['rejected'] += 1
         item['elapsed_seconds'] = time.monotonic()-attempt
-    report.update(holes_after=work.topology.findNumHoles(), closed_after=work.topology.isClosed(),
-                  elapsed_seconds=time.monotonic()-started)
+    report.update(holes_after=work.topology.findNumHoles(), closed_after=work.topology.isClosed())
+    # Only after the lid exists is signed volume a reliable orientation test
+    # for an originally open body. All accepted patches own a private mesh.
+    if report['filled'] and report['closed_after']:
+        from .orientation import orient_closed_components
+        report['closed_orientation_corrections'] = orient_closed_components(work, mm)
+    report['elapsed_seconds'] = time.monotonic()-started
     progress(1)
     if loops:
         emit(f"Заполнение дыр: {len(loops)} → {report['holes_after']}; принято {report['filled']}, "

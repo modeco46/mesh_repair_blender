@@ -10,6 +10,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import tomllib
 import uuid
 
 import bpy
@@ -18,8 +19,11 @@ from bpy.types import Operator, Panel, PropertyGroup
 from bpy_extras.io_utils import ExportHelper
 
 from .bridge import create_mesh_object, write_selected_stl
-from . import bl_info, heatmap
+from . import heatmap
 
+
+with Path(__file__).with_name("blender_manifest.toml").open("rb") as manifest:
+    _ADDON_VERSION = tomllib.load(manifest)["version"]
 
 _ACTIVE = None
 _CACHED_JOB_DIR = None
@@ -174,7 +178,7 @@ def _read_progress(job, runtime):
 
 
 def _store_report(name, report):
-    report['blender_addon_version'] = '.'.join(map(str, bl_info['version']))
+    report["blender_addon_version"] = _ADDON_VERSION
     base = f"MeshRepair Report - {name}"
     text = bpy.data.texts.new(base)
     text.write(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False))
@@ -321,7 +325,6 @@ def _begin(context, operation, operator, force_no_sharp=False):
     runtime.stage = "Подготовка геометрии"
     runtime.message = ""
     runtime.last_log = ""
-    runtime.last_log = ""
     runtime.retry_available = False
     if operation != "heatmap":
         runtime.has_result = False
@@ -372,14 +375,17 @@ def _begin(context, operation, operator, force_no_sharp=False):
         job["process"] = subprocess.Popen(_command(job, operation), stdout=log_stream, stderr=subprocess.STDOUT,
                                           env=environment, creationflags=flags)
         job["timer"] = context.window_manager.event_timer_add(0.2, window=context.window)
-        _ACTIVE = job
         operator._mesh_repair_job_id = job["id"]
         context.window_manager.modal_handler_add(operator)
+        _ACTIVE = job
         runtime.stage = "Запуск MeshRepair"
         _redraw(context)
         return {"RUNNING_MODAL"}
     except Exception as exc:
         if "job" in locals():
+            _ACTIVE = None
+            if job.get("timer") is not None:
+                context.window_manager.event_timer_remove(job["timer"])
             process = job.get("process")
             if process is not None and process.poll() is None:
                 process.terminate()

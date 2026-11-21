@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 import traceback
 
 
@@ -36,13 +37,15 @@ class Channel:
         self.stream = path.open("a", encoding="utf-8", buffering=1)
         self.last_progress = None
         self.log_tail = deque(maxlen=100)
+        self.started = time.monotonic()
 
     def send(self, kind: str, value) -> None:
         if kind == "progress":
             self.last_progress = value
         elif kind == "log":
             self.log_tail.append(value)
-        self.stream.write(json.dumps({"type": kind, "value": value}, ensure_ascii=False, allow_nan=False) + "\n")
+        event = {"type": kind, "value": value, "elapsed_seconds": round(time.monotonic()-self.started, 3)}
+        self.stream.write(json.dumps(event, ensure_ascii=False, allow_nan=False) + "\n")
 
     def close(self) -> None:
         self.stream.close()
@@ -86,7 +89,7 @@ def main(argv=None) -> int:
                 raise ValueError("Result array paths are required for repair.")
             report = run(args.source, settings=settings, emit=lambda text: channel.send("log", text),
                          progress=lambda event: channel.send("progress", event), work_dir=args.job_dir,
-                         array_output=(args.vertices, args.faces))
+                         array_output=(args.vertices, args.faces), checkpoint=lambda data: channel.send("diagnostic", data))
         report = clean_json(report)
         report_path = args.job_dir.parent / "report.json"
         _atomic_json(report_path, report)

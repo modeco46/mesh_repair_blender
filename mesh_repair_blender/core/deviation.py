@@ -67,3 +67,52 @@ def source_deviation(source, target, mm, quality_mm, map_path, acceleration=None
             'top10': [{'vertex_id': int(i), 'coordinates_mm': vertices[i].tolist(),
                        'deviation_mm': float(outer[i])} for i in top],
             'elapsed_seconds': time.monotonic()-started}
+
+
+def recover_exterior_details(source, current, voxel_reference, mm, q, acceleration, report):
+    """Recover isolated sub-voxel losses on an already simplified, closed surface."""
+    from .engine import diagnostics, level_set_distances, valid
+
+    checked = source_deviation(source, current, mm, q, None, acceleration)
+    count = checked['vertices_over_quality']
+    report.update(accepted=False, exterior_over_before=count, max_before_mm=checked['max_deviation_mm'])
+    # The ten recorded peaks cover all offenders only in this case. Larger
+    # mismatches require reconstruction; a local vertex adjustment cannot fix them.
+    if not 0 < count <= len(checked['top10']) or checked['max_deviation_mm'] > 1.25*q:
+        return current, None
+    shifts = {}
+    for peak in checked['top10']:
+        if peak['deviation_mm'] <= q:
+            continue
+        point = mm.Vector3f(*peak['coordinates_mm'])
+        projection = current.projectPoint(point)
+        delta = point-projection.proj.point
+        shift = np.asarray(list(delta*(1-.91*q/delta.length())))
+        for vertex in current.topology.getTriVerts(projection.proj.face):
+            shifts.setdefault(int(vertex), []).append(shift)
+    candidate = mm.Mesh(current)
+    moved = mm.VertBitSet()
+    for vertex, offsets in shifts.items():
+        v = mm.VertId(vertex)
+        moved.autoResizeSet(v)
+        candidate.points[v] = candidate.points[v]+mm.Vector3f(*np.mean(offsets, axis=0))
+    candidate.invalidateCaches()
+    changed = mm.getIncidentFaces(current.topology, moved)
+    if any(mm.dot(current.dirDblArea(f), candidate.dirDblArea(f)) <= 0 for f in changed):
+        report['reason'] = 'face_flipped_or_degenerate'
+        return current, None
+    after = diagnostics(candidate, mm)
+    if not valid(after) or abs(after['signed_volume_mm3']-current.volume()) > .001*current.volume():
+        report['reason'] = 'invalid_candidate'
+        return current, None
+    fidelity = level_set_distances(voxel_reference, candidate, mm, q)
+    if not fidelity['within_step']:
+        report.update(reason='voxel_reference_distance', voxel_reference=fidelity)
+        return current, None
+    measured = source_deviation(source, candidate, mm, q, None, acceleration)
+    report.update(exterior_over_after=measured['vertices_over_quality'], max_after_mm=measured['max_deviation_mm'])
+    if measured['vertices_over_quality']:
+        report['reason'] = 'exterior_distance'
+        return current, None
+    report.update(accepted=True, moved_vertices=len(shifts), voxel_reference=fidelity)
+    return candidate, after

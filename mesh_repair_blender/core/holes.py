@@ -200,6 +200,27 @@ def fill_simple_holes(mesh, mm, quality_mm, progress=lambda value: None, emit=la
                 item['reason'] = 'patch_work_limit'
             else:
                 collisions = patch_collisions(work, candidate, patch, mm).count()
+                if collisions and not flat:
+                    # Smoothing may push a lid through a nearby wall. Try the
+                    # original rim again without moving or subdividing it.
+                    alternative = mm.Mesh(work)
+                    rim = mm.FillHoleNicelySettings()
+                    rim.triangulateOnly = True
+                    metric = mm.FillHoleParams()
+                    metric.metric = mm.getUniversalMetric(alternative)
+                    rim.triangulateParams = metric
+                    item['curvature_patch_intersections'] = collisions
+                    try:
+                        cap = mm.fillHoleNicely(alternative, edge, rim)
+                        if (cap.count() == len(ids)-2 and alternative.topology.findNumHoles() == before_holes-1
+                                and alternative.topology.checkValidity()
+                                and np.array_equal(mn.getNumpyVerts(alternative), mn.getNumpyVerts(work))
+                                and not patch_collisions(work, alternative, cap, mm).count()):
+                            candidate, patch, collisions = alternative, cap, 0
+                            remaining = before_holes-1
+                            item['method'] = 'fixed_rim_triangulation'
+                    except RuntimeError as exc:
+                        item['fixed_rim_error'] = str(exc)
                 # A planar cap must be a clean triangulation. Crossing a second
                 # rim or another part is not a reason to cut the original walls.
                 if collisions:

@@ -66,13 +66,14 @@ class SharpeningRetryRequired(RuntimeError):
 
 class Progress:
     """Monotonic stage-weighted progress, driven by actual SDK callbacks."""
-    def __init__(self, emit, log=None, timings=None, device=None):
+    def __init__(self, emit, log=None, timings=None, device=None, checkpoint=None):
         self.emit = emit
         self.percent = 0
         self.last_time = 0
         self.stage = ""
         self.stage_started = time.monotonic()
         self.log, self.timings, self.device = log, timings, device
+        self.checkpoint = checkpoint or (lambda fields: None)
 
     def update(self, percent, stage):
         percent = max(self.percent, min(100, int(percent)))
@@ -328,6 +329,7 @@ def try_closed_level_set(mesh, mm, settings, tracker, report, emit, translation)
     item = {'backend': 'openvdb_closed_level_set', 'compute_device': 'cpu_native_parallel', 'closing_offset_mm': closing,
             'probe': False, 'timing': False, 'sharpening': False, 'voxel_size_mm': q, 'accepted': False}
     report['voxel_passes'].append(item)
+    tracker.checkpoint({'voxel_pass': dict(item)})
     started = time.monotonic()
     try:
         # A zero isosurface at a grazing self-contact can create hundreds of
@@ -403,7 +405,12 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
     # Two triangles per voxel-sized surface square already make a dense
     # isosurface even when the damaged input itself has only tens of thousands.
     dense_surface = large_source or 2*estimate >= DENSE_MESH_FACES
-    if (dense_surface and not settings.restore_sharp_edges and mesh.topology.isClosed() and
+    closed = mesh.topology.isClosed()
+    # These rims crossed another wall when smoothed. The winding sign can
+    # distinguish the resulting folded surface after the fixed-rim cap closes it.
+    folded_rims = closed and any(h.get('method') == 'fixed_rim_triangulation'
+                                 for h in report.get('hole_filling', {}).get('details', []))
+    if (dense_surface and not folded_rims and not settings.restore_sharp_edges and closed and
             mm.MeshComponents.getNumComponents(mm.MeshPart(mesh)) == 1):
         checked = report.get('after_hole_filling', {})
         crossing = checked.get('has_self_intersection')
@@ -416,15 +423,10 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
             if direct is not None:
                 return direct
     winding = None
-    try:
-        cuda = None if settings.disable_cuda else cuda_module()
-        if cuda is not None:
-            winding = cuda.FastWindingNumber(mesh)
-    except Exception as exc:
-        report['warnings'].append(f'CUDA недоступна, используется CPU: {exc}')
+    cuda = None if settings.disable_cuda else cuda_module()
 
     def reconstruct(sharpen, step, probe=False, stage=None, span=None, winding_beta=2.0, deadline=None):
-        nonlocal winding
+        nonlocal winding, cuda
         params = mm.GeneralOffsetParameters() if sharpen else mm.OffsetParameters()
         params.voxelSize = step
         params.signDetectionMode = mm.SignDetectionMode.HoleWindingRule
@@ -437,11 +439,17 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
         # dense OpenVDB probe can predict hours for a much faster streamed run.
         streaming = (grid_cells > DENSE_WINDING_VOXEL_LIMIT or
                      (timing and cells > DENSE_WINDING_VOXEL_LIMIT))
-        # Non-chunked external winding disables the SDK's FunctionVolume.
-        params.fwn = (winding if not streaming or isinstance(winding, mm.IFastWindingNumberByParts)
-                      else None)
+        # The native CPU FunctionVolume can evaluate the sign only in a thin
+        # surface band of a closed mesh. The CUDA full-field call visits the box.
+        narrow_band = streaming and not sharpen and closed
+        if not narrow_band and cuda is not None and winding is None:
+            try:
+                winding = cuda.FastWindingNumber(mesh)
+            except (RuntimeError, MemoryError) as exc:
+                report['warnings'].append(f'CUDA недоступна, используется CPU: {exc}')
+                cuda = None
+        params.fwn = None if narrow_band else winding
         params.memoryEfficient = True
-        narrow_band = streaming and not sharpen and params.fwn is None and mesh.topology.isClosed()
         params.closeHolesInHoleWindingNumber = not narrow_band
         callback = tracker.callback(start, end, stage+(' (по слоям)' if streaming else ''))
         params.callBack = callback if deadline is None else \
@@ -450,33 +458,52 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
             params.mode = mm.GeneralOffsetParametersMode.Sharpening
         operation = mm.generalOffsetMesh if sharpen else mm.mcOffsetMesh if streaming else mm.offsetMesh
         backend = 'sharpening' if sharpen else 'marching_cubes_by_parts' if streaming else 'smooth_openvdb'
-        device = ('cuda_winding_with_cpu_marching_cubes' if streaming else 'cuda_winding_with_cpu_openvdb') if params.fwn is not None else 'cpu_native_parallel'
+        slabbed = params.fwn is not None and (streaming or sharpen)
+        device = ('cuda_winding_with_cpu_marching_cubes' if slabbed else 'cuda_winding_with_cpu_openvdb') if params.fwn is not None else 'cpu_native_parallel'
         report['compute_device'] = device
         item = {'probe': probe, 'sharpening': sharpen, 'voxel_size_mm': step, 'compute_device': device,
                 'timing': timing, 'backend': backend, 'streaming': streaming,
                 'grid_cells': grid_cells, 'cpu_closed_surface_band': narrow_band, 'winding_beta': winding_beta}
+        if slabbed:
+            item['field_evaluation'] = 'bounded_cuda_slabs'
+        elif narrow_band:
+            item['field_evaluation'] = 'closed_cpu_surface_band'
         report['voxel_passes'].append(item)
+        tracker.checkpoint({'voxel_estimate': report['voxel_estimate'], 'voxel_pass': dict(item)})
         started = time.monotonic()
         emit(f'{stage}: шаг {step:g} мм; backend={backend}; compute_device={device}.')
         try:
             try:
+                if slabbed:
+                    from .winding import winding_slabs
+
+                    def completed(block):
+                        item['slabs'] = block
+                        tracker.checkpoint({'voxel_pass': dict(item)})
+                        callback(.90*block['completed_layers']/block['total_layers'])
+
+                    return winding_slabs(mesh, mm, winding, params, completed, sharpen=sharpen, deadline=deadline)
                 result = operation(mm.MeshPart(mesh), 0, params)
                 if narrow_band and not result.topology.isClosed():
                     item['closed_surface_band_fallback'] = True
                     params.closeHolesInHoleWindingNumber = True
                     del result
+                    item['field_evaluation'] = 'full_cpu_field'
+                    tracker.checkpoint({'voxel_pass': dict(item)})
                     emit('Узкая область расчёта оставила отверстия; повтор с полным полем и тем же шагом.')
                     result = operation(mm.MeshPart(mesh), 0, params)
                 return result
-            except RuntimeError as exc:
+            except (RuntimeError, MemoryError) as exc:
                 if deadline is not None and time.monotonic() >= deadline:
                     raise TimeoutError('Уточнение winding остановлено по лимиту времени. '
                                        'Подробности неудачного ремонта сохранены в JSON-отчёте.') from exc
                 if params.fwn is None:
                     raise
                 report['warnings'].append(f'Ошибка CUDA; повтор на CPU с тем же шагом: {exc}')
-                winding = params.fwn = None
+                cuda = winding = params.fwn = None
                 report['compute_device'] = item['fallback_device'] = 'cpu_native_parallel'
+                item.update(cuda_error=str(exc), field_evaluation='full_cpu_field')
+                tracker.checkpoint({'voxel_pass': dict(item)})
                 emit('Повтор после ошибки CUDA: compute_device=cpu_native_parallel.')
                 return operation(mm.MeshPart(mesh), 0, params)
         finally:
@@ -485,9 +512,10 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
 
     # A timing-only coarse pass still rebuilds structures for every input
     # triangle. It cannot change the ordinary (non-sharpening) result.
-    skip_probe = large_source and not settings.restore_sharp_edges
+    skip_probe = (large_source or folded_rims) and not settings.restore_sharp_edges
     if cells >= 30e6 and skip_probe:
-        report['voxel_estimate'].update(method='bbox_and_surface_area', probe_skipped='dense_input')
+        report['voxel_estimate'].update(method='bbox_and_surface_area',
+                                        probe_skipped='closed_fixed_rims' if folded_rims else 'dense_input')
     if cells >= 30e6 and not skip_probe:
         # Bound the probe itself for very fine grids. Total cells estimate work,
         # not peak memory of the layer-wise CPU/CUDA implementation.
@@ -1179,7 +1207,7 @@ def finish_planar_faces(reference, current, mm, settings, tracker, report, emit,
 
 
 def run(source, destination=None, settings=Settings(), emit=lambda message: None,
-        progress=lambda event: None, work_dir=None, *, array_output=None):
+        progress=lambda event: None, work_dir=None, *, array_output=None, checkpoint=None):
     from .storage import create_job, remove_job
     settings.validate()
     source = Path(source).resolve()
@@ -1205,7 +1233,7 @@ def run(source, destination=None, settings=Settings(), emit=lambda message: None
     report = {}
     started = time.monotonic()
     try:
-        report = _run(source, settings, emit, progress, folder, report, array_output=array_output)
+        report = _run(source, settings, emit, progress, folder, report, array_output=array_output, checkpoint=checkpoint)
         if target:
             _publish_cli(report, target)
         return clean_json(report)
@@ -1288,18 +1316,22 @@ def _export_stl(final, tmp, mm, tracker, report, emit, fallbacks):
         elif stage == 'planar_finish':
             report['planar_finish'].update(accepted=False, after=restored['triangles'],
                                           reason='export_validation_failed')
+        elif stage == 'exterior_recovery':
+            report['exterior_recovery'].update(accepted=False, reason='export_validation_failed')
+        elif stage == 'voxel_handle':
+            report['voxel_handle'].update(accepted=False, reason='export_validation_failed')
     report['final_roundtrips'] = len(roundtrips)
     return exported, final_info
 
 
-def _run(source, settings, emit, progress, folder, report=None, *, array_output=None):
+def _run(source, settings, emit, progress, folder, report=None, *, array_output=None, checkpoint=None):
     from meshlib import mrmeshpy as mm, mrmeshnumpy as mn
     from .orientation import prepare_orientation, finite_vertices, is_flat_input
     from .inspection import describe_mesh
     started = time.monotonic()
     if report is None:
         report = {}
-    report.update({'version': '1.0.0', 'engine_revision': 'blender-1.4.1',
+    report.update({'version': '1.0.0', 'engine_revision': 'blender-1.4.2',
               'settings': asdict(settings), 'source': str(source),
               'units': 'mm', 'tolerance_certified': False, 'warnings': [], 'steps': [],
               'compute_device': 'cpu_native_parallel', 'acceleration': capabilities(settings.disable_cuda)})
@@ -1308,7 +1340,9 @@ def _run(source, settings, emit, progress, folder, report=None, *, array_output=
         lambda stage: report['compute_device'] if stage.startswith(
             ('Проба острых рёбер', 'Оценка времени', 'Восстановление поверхности', 'Уточнение воксельной поверхности'))
         else ','.join(report['acceleration'].get('projection_backends', ['cpu_native_parallel']))
-        if stage == 'Карта отклонения от исходника' or stage.startswith('Строгая проверка') else 'cpu_native_parallel')
+        if stage == 'Карта отклонения от исходника' or stage.startswith('Строгая проверка') else 'cpu_native_parallel',
+        checkpoint)
+    tracker.checkpoint({'engine_revision': report['engine_revision'], 'acceleration': report['acceleration']})
     emit('compute_device=cpu_native_parallel; CUDA '+('выключена настройкой.' if settings.disable_cuda else 'авто.'))
     load_settings = mm.MeshLoadSettings()
     skipped, duplicated = mm.int_output(), mm.int_output()
@@ -1359,6 +1393,7 @@ def _run(source, settings, emit, progress, folder, report=None, *, array_output=
     before['skipped_faces'], before['non_finite_vertices'] = skipped.value, 0
     info = topology_info(mesh, mm)
     report['prepared'] = info
+    tracker.checkpoint({'before': before, 'prepared': info})
     emit(f"После согласования: треугольников {info['triangles']:,}; оболочек {info['components']}; дыр {info['boundary_loops']}.")
     from .holes import fill_simple_holes
     before_holes = mesh
@@ -1410,6 +1445,8 @@ def _run(source, settings, emit, progress, folder, report=None, *, array_output=
             report['after_hole_filling'] = info
             emit(f'Локальное исправление заплаток не принято; отменено заплаток: {pending}.')
     report['steps'].append({'name': 'Заполнение простых дыр', **hole_report})
+    tracker.checkpoint({'after_hole_filling': info, 'hole_filling': {key: hole_report[key]
+                        for key in ('holes_before', 'holes_after', 'filled', 'rejected', 'skipped')}})
     del before_holes
     if hole_report['holes_after']:
         report['warnings'].append(f"После безопасного заполнения осталось дыр: {hole_report['holes_after']}. Они переданы объёмному восстановлению.")
@@ -1527,6 +1564,32 @@ def _run(source, settings, emit, progress, folder, report=None, *, array_output=
         final = finish_planar_faces(repaired, final, mm, settings, tracker, report, emit, shape_reference)
         if final is not before_planar and array_output is None:
             fallbacks.append((before_planar, before_planar_info, 'planar_finish'))
+    if (report['algorithm'] == 'sparse_openvdb_winding' and not settings.strict_tolerance
+            and final is not repaired and final.topology.numValidFaces() < DENSE_MESH_FACES
+            and reference.topology.numValidFaces() < DENSE_MESH_FACES):
+        from .deviation import recover_exterior_details
+        from .seams import close_voxel_handle
+        tracker.update(95, 'Проверка мелких наружных деталей')
+        try:
+            capped, checked = close_voxel_handle(final, info, report['after'], repaired, mm, settings.quality_mm, report)
+            if capped is not final:
+                if array_output is None:
+                    fallbacks.append((final, report['after'], 'voxel_handle'))
+                final, report['after'] = capped, checked
+            del capped
+        except (RuntimeError, MemoryError) as exc:
+            report['voxel_handle'] = {'accepted': False, 'error': str(exc)}
+        detail = report['exterior_recovery'] = {}
+        try:
+            fitted, verified = recover_exterior_details(reference, final, repaired, mm, settings.quality_mm,
+                                                        report['acceleration'], detail)
+            if verified is not None:
+                if array_output is None:
+                    fallbacks.append((final, report['after'], 'exterior_recovery'))
+                final, report['after'] = fitted, verified
+            del fitted
+        except (RuntimeError, MemoryError) as exc:
+            detail.update(accepted=False, reason='detail_check_failed', error=str(exc))
     t = time.monotonic()
     if array_output is None:
         exported, final_info = _export_stl(final, tmp, mm, tracker, report, emit, fallbacks)

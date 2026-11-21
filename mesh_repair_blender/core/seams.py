@@ -4,6 +4,46 @@ import numpy as np
 from .reduction import triangle_upper_bounds
 
 
+def close_voxel_handle(mesh, prepared, current, voxel_reference, mm, q, report):
+    """A single new handle on a genus-zero body can be a marching-cubes seam."""
+    from .engine import diagnostics, level_set_distances, same_closed_surface_topology, valid
+    from .reduction import verify_surface_bound
+    if not (prepared['closed'] and prepared['topology_valid'] and prepared['components'] == current['components'] == 1
+            and 2*prepared['vertices']-prepared['triangles'] == 4 and 2*current['vertices'] == current['triangles']):
+        return mesh, current
+    options = mm.DetectTunnelSettings()
+    options.maxTunnelLength = 4*q
+    item = report['voxel_handle'] = {'accepted': False, 'max_loop_length_mm': options.maxTunnelLength}
+    old = mm.detectTunnelFaces(mm.MeshPart(mesh), options)
+    if not 0 < old.count() <= 64:
+        item['reason'] = 'no_subvoxel_handle'
+        return mesh, current
+    candidate = mm.Mesh(mesh)
+    fill = mm.FillHoleNicelySettings()
+    fill.triangulateOnly = True
+    new = mm.patchMesh(candidate, old, fill)
+    if not 0 < new.count() <= 64:
+        item['reason'] = 'unexpected_patch_size'
+        return mesh, current
+    proof = verify_surface_bound(mesh.cloneRegion(old), candidate.cloneRegion(new), q, max_checks=16000,
+                                 acceleration=report.get('acceleration'))
+    item.update(removed_faces=old.count(), added_faces=new.count(), verification=proof)
+    if not proof['verified']:
+        item['reason'] = 'unconfirmed_surface_distance'
+        return mesh, current
+    candidate.pack()
+    checked = diagnostics(candidate, mm)
+    if not valid(checked) or not same_closed_surface_topology(prepared, checked):
+        item['reason'] = 'invalid_surface_or_genus'
+        return mesh, current
+    item['voxel_reference'] = level_set_distances(voxel_reference, candidate, mm, q)
+    if not item['voxel_reference']['within_step']:
+        item['reason'] = 'voxel_reference_distance'
+        return mesh, current
+    item['accepted'] = True
+    return candidate, checked
+
+
 def fill_voxel_seams(mesh, mm, tolerance):
     """Keep every existing face/vertex; bound each new triangle to an old rim edge.
 

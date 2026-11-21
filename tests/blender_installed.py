@@ -104,13 +104,15 @@ def main():
     runtime, cancelled = finish(addon, job)
     assert cancelled["status"] == "cancelled" and cancelled["last_progress"]["stage"]
     assert cancelled["elapsed_seconds"] > 0 and not source.hide_get()
+    assert cancelled["events"] and all("elapsed_seconds" in event for event in cancelled["events"])
 
     status = bpy.ops.mesh_repair.repair_selected("INVOKE_DEFAULT")
     assert status == {"RUNNING_MODAL"}, (status, runtime.stage, runtime.message)
     job = addon._ACTIVE
     runtime, report = finish(addon, job)
     assert runtime.stage == "Готово", report.get("error", runtime.message)
-    assert report["blender_addon_version"] == "1.4.1" and report["engine_revision"] == "blender-1.4.1"
+    assert report["blender_addon_version"] == "1.4.2" and report["engine_revision"] == "blender-1.4.2"
+    assert job["diagnostics"]["after_hole_filling"] == report["after_hole_filling"]
     info = report["after"]
     assert info["closed"] and info["topology_valid"] and info["components"] == 1
     assert info["boundary_loops"] == info["self_intersecting_faces"] == 0

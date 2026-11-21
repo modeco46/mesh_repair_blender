@@ -1,6 +1,7 @@
 """Blender UI and cancellable process orchestration for MeshRepair."""
 from __future__ import annotations
 
+from collections import deque
 import json
 import os
 from pathlib import Path
@@ -175,6 +176,24 @@ def _read_progress(job, runtime):
             runtime.stage = str(value.get("stage", runtime.stage))
         elif event.get("type") == "log":
             runtime.last_log = str(event.get("value", ""))[-1024:]
+        elif event.get("type") == "diagnostic":
+            job["diagnostics"].update(event["value"])
+            continue
+        job["event_tail"].append(event)
+
+
+def _interrupted_report(job, runtime):
+    path = job["directory"] / "worker.log"
+    tail = ""
+    if path.is_file():
+        with path.open("rb") as stream:
+            stream.seek(max(0, path.stat().st_size - 16_384))
+            tail = stream.read().decode("utf-8", errors="replace")
+    return {"operation": job["operation"], "settings": json.loads(job["settings"].read_text(encoding="utf-8")),
+            "blender_source_objects": job["source_names"], "blender_mm_per_unit": job["mm_per_unit"],
+            "elapsed_seconds": time.monotonic() - job["started"], "last_progress": job.get("last_worker_progress"),
+            "last_log": runtime.last_log, "worker_diagnostics": job["diagnostics"],
+            "events": list(job["event_tail"]), "worker_log_tail": tail}
 
 
 def _store_report(name, report):
@@ -216,13 +235,7 @@ def _finish_job(context, job):
             result = json.loads(job["result_file"].read_text(encoding="utf-8"))
         if job.get("cancelled"):
             # The panel can already say Stop; retain the actual worker stage.
-            cancelled = {
-                "status": "cancelled", "operation": job["operation"],
-                "settings": json.loads(job["settings"].read_text(encoding="utf-8")),
-                "blender_source_objects": job["source_names"], "blender_mm_per_unit": job["mm_per_unit"],
-                "elapsed_seconds": time.monotonic() - job["started"],
-                "last_progress": job.get("last_worker_progress"), "last_log": runtime.last_log,
-            }
+            cancelled = dict(_interrupted_report(job, runtime), status="cancelled")
             runtime.report_text = _store_report(job["result_name"], cancelled).name
             runtime.stage = "Остановлено"
             runtime.message = "Расчёт остановлен пользователем."
@@ -231,16 +244,8 @@ def _finish_job(context, job):
             runtime.stage = "Ошибка"
             runtime.message = (f"Процесс завершился с кодом {job['process'].returncode}. "
                                "Подробности сохранены в JSON-отчёте.")
-            log_path = job["directory"] / "worker.log"
-            log_tail = ""
-            if log_path.is_file():
-                with log_path.open("rb") as stream:
-                    stream.seek(max(0, log_path.stat().st_size - 16_384))
-                    log_tail = stream.read().decode("utf-8", errors="replace")
-            report = {"status": "error", "error": runtime.message,
-                      "operation": job["operation"], "returncode": job["process"].returncode,
-                      "settings": json.loads(job["settings"].read_text(encoding="utf-8")),
-                      "blender_source_objects": job["source_names"], "worker_log_tail": log_tail}
+            report = dict(_interrupted_report(job, runtime), status="error", error=runtime.message,
+                          returncode=job["process"].returncode)
             runtime.report_text = _store_report(job["result_name"], report).name
             return
         status = result.get("status")
@@ -351,6 +356,8 @@ def _begin(context, operation, operator, force_no_sharp=False):
             "distances": directory / "distances.npy",
             "progress_offset": 0,
             "progress_pending": b"",
+            "event_tail": deque(maxlen=120),
+            "diagnostics": {},
             "source_names": [obj.name for obj in context.selected_objects if obj.type == "MESH"],
             "quality_mm": settings.quality_mm,
             "hide_sources": settings.hide_sources,

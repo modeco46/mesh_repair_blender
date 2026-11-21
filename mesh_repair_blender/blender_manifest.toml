@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "mesh_repair_blender"
-version = "1.4.0"
+version = "1.4.1"
 name = "Mesh Repair"
 tagline = "Repair meshes with native CPU parallelism and NVIDIA CUDA"
 maintainer = "modeco46"

@@ -2,6 +2,8 @@
 import importlib
 import json
 import os
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import time
 
@@ -9,13 +11,66 @@ import bpy
 import numpy as np
 
 
-def finish(addon, job):
-    job["process"].wait(timeout=180)
+def finish(addon, job, timeout=180):
+    job["process"].wait(timeout=timeout)
     owner = SimpleNamespace(_mesh_repair_job_id=job["id"])
     assert addon._MeshRepairModal.modal(owner, bpy.context, SimpleNamespace(type="TIMER")) == {"FINISHED"}
     runtime = bpy.context.window_manager.mesh_repair_runtime
     assert not runtime.busy
     return runtime, json.loads(bpy.data.texts[runtime.report_text].as_string())
+
+
+def write_folded_ring(path):
+    # Deliberate self-contact, two missing facets, and a reversed patch. The
+    # body has one through-hole. Write strips to avoid a 2M-element Python list.
+    rows, columns = 1500, 720
+    u = np.arange(rows)[:, None] * 2*np.pi/rows
+    v = (np.arange(columns)[None, :] + .3) * 2*np.pi/columns
+    radius = 2.4 + .7*np.cos(v) + .03*np.cos(7*u)
+    z = .74*np.sin(v)*(.48+np.cos(v)) + .037*np.sin(5*u)
+    points = np.stack((radius*np.cos(u), radius*np.sin(u), z), axis=-1).astype('<f4')
+    dtype = np.dtype([('normal', '<f4', (3,)), ('vertices', '<f4', (3, 3)), ('attribute', '<u2')])
+    with path.open('wb') as stream:
+        stream.write(b'Folded ring'.ljust(80, b'\0'))
+        stream.write((2*rows*columns-2).to_bytes(4, 'little'))
+        for i in range(rows):
+            a, b = points[i], points[(i+1) % rows]
+            c, d = np.roll(b, -1, axis=0), np.roll(a, -1, axis=0)
+            strip = np.zeros(2*columns, dtype=dtype)
+            strip['vertices'][::2] = np.stack((a, b, c), axis=1)
+            strip['vertices'][1::2] = np.stack((a, c, d), axis=1)
+            if 90 <= i < 96:
+                strip['vertices'][80:90] = strip['vertices'][80:90, ::-1]
+            if i in (100, 1000):
+                strip = np.delete(strip, 321)
+            strip.tofile(stream)
+
+
+def check_large_repair(addon):
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder)/'folded-ring.stl'
+        write_folded_ring(path)
+        bpy.ops.wm.stl_import(filepath=str(path))
+    source = bpy.context.active_object
+    bpy.ops.object.select_all(action='DESELECT')
+    source.select_set(True)
+    bpy.context.scene.mesh_repair_settings.quality_mm = .01
+    assert bpy.ops.mesh_repair.repair_selected("INVOKE_DEFAULT") == {"RUNNING_MODAL"}
+    runtime, report = finish(addon, addon._ACTIVE, timeout=420)
+    assert runtime.stage == 'Готово', report.get('error', runtime.message)
+    assert report['before']['triangles'] == 2_159_998
+    assert report['algorithm'] == 'closed_openvdb_level_set', report['voxel_passes']
+    assert report['dense_routing']['needs_voxels'] and not report['local_repair']['attempted']
+    seed, *rest = report['simplification']['attempts']
+    assert seed['phase'] == 'dense_seed' and all(p['input_triangles'] < seed['input_triangles'] for p in rest)
+    info = report['after']
+    assert info['topology_valid'] and info['closed'] and info['components'] == 1
+    assert info['boundary_loops'] == info['self_intersecting_faces'] == 0
+    assert 2*info['vertices'] == info['triangles']  # Exactly one handle.
+    assert info['triangles'] < 200_000 and 15.0 < info['signed_volume_mm3'] < 15.5
+    deviation = report['source_deviation']['max_deviation_all_mm']
+    assert deviation <= .010001 and len(runtime.result_object.data.polygons) == info['triangles']
+    print('DENSE_INSTALLED_REPAIR_OK', info['triangles'], info['signed_volume_mm3'], deviation, report['elapsed_seconds'])
 
 
 def main():
@@ -55,7 +110,7 @@ def main():
     job = addon._ACTIVE
     runtime, report = finish(addon, job)
     assert runtime.stage == "Готово", report.get("error", runtime.message)
-    assert report["blender_addon_version"] == "1.4.0" and report["engine_revision"] == "blender-1.4.0"
+    assert report["blender_addon_version"] == "1.4.1" and report["engine_revision"] == "blender-1.4.1"
     info = report["after"]
     assert info["closed"] and info["topology_valid"] and info["components"] == 1
     assert info["boundary_loops"] == info["self_intersecting_faces"] == 0
@@ -68,6 +123,7 @@ def main():
     mesh.loops.foreach_get("vertex_index", actual)
     assert np.array_equal(actual.reshape(-1, 3), faces)
     print("INSTALLED_REPAIR_OK", info["triangles"], info["signed_volume_mm3"], report["elapsed_seconds"])
+    check_large_repair(addon)
 
 
 if __name__ == "__main__":

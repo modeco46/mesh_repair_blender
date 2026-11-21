@@ -10,9 +10,15 @@ import numpy as np
 from .compute import Projector, cpu_count
 
 
-def prepare_reduction(mesh, mm):
+def prepare_reduction(mesh, mm, *, components=None):
     """Cache immutable topology groups once for the complete tolerance search."""
     from meshlib import mrmeshnumpy as mn
+    if components == 1:
+        # propose_reduction makes its own mutable copy. A checked single body
+        # doesn't need another dense mesh or a per-face component map here.
+        small = mesh.topology.numValidFaces() < 50
+        return {'candidate': None if small else mesh, 'protected': mesh if small else None,
+                'protected_count': int(small)}
     candidate = mm.Mesh(mesh)
     candidate.pack()
     # Parallel decimation must not even receive the tiny shells. bdVerts alone
@@ -35,7 +41,7 @@ def prepare_reduction(mesh, mm):
 
 
 def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve_planar_corners=False,
-                      checkpoint=None, prepared=None, endpoint_only=False):
+                      checkpoint=None, prepared=None, endpoint_only=False, single_pass=False):
     from meshlib import mrmeshnumpy as mn
     prepared = prepare_reduction(mesh, mm) if prepared is None else prepared
     if prepared['candidate'] is None:
@@ -47,7 +53,7 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve
     # A general QEM pass already reduces planar faces. Running a separate
     # planar pass first resets the metric and spends the error budget twice.
     if settings.simplify_curved:
-        requested.extend([('curved', None)] * 3)
+        requested.extend([('curved', None)] * (1 if single_pass else 3))
     elif settings.collapse_coplanar:
         requested.append(('coplanar', settings.coplanar_angle_deg))
     for index, (kind, angle) in enumerate(requested):
@@ -89,8 +95,9 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve
         # repaired surface, not by locking voxel-generated normal discontinuities.
         # Partitioned decimation locks the partition seams: with crease protection a perfect 6.3M-triangle cube
         # ended with 252 instead of 12 triangles. The general (curved) pass is not affected (40 vs 34), so only
-        # the planar pass runs unpartitioned.
-        params.subdivideParts = 1 if kind == 'coplanar' else \
+        # the compact planar finish runs unpartitioned. On a multi-million
+        # face surface keep native parallelism, then validate seam geometry.
+        params.subdivideParts = 1 if kind == 'coplanar' and before < 2_000_000 else \
             min(os.cpu_count() or 1, cpu_count(), max(1, before // 25_000))
         start, end = 78 + 7 * index / len(requested), 78 + 7 * (index + 1) / len(requested)
         stage = 'Схлопывание плоских участков' if kind == 'coplanar' else 'Упрощение всей поверхности в пределах допуска'
@@ -530,6 +537,7 @@ def measured_distance(reference, candidate, mm):
 
 
 REASONS = {
+    'level_set_distance_exceeds_step': 'Измеренное отклонение от сетки после закрытия дыр превышает выбранный шаг.',
     'self_intersections': 'После упрощения остались пересекающиеся грани.',
     'volume_changed': 'Упрощение меняет объём исправленного тела более чем на 2%.',
     'genus_changed': 'После упрощения изменилось число сквозных отверстий.',

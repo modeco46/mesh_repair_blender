@@ -190,6 +190,11 @@ def orient_closed_components(mesh, mm):
     from meshlib import mrmeshnumpy as mn
     mesh.pack()
     mapping, count = mm.MeshComponents.getAllComponentsMap(mm.MeshPart(mesh))
+    if count == 1:
+        if mesh.topology.isClosed() and mesh.volume() < 0:
+            mesh.topology.flipOrientation()
+            return 1
+        return 0
     labels = np.fromiter((int(x) for x in mapping), dtype=np.int32, count=mapping.size())
     closed = np.ones(count, bool)
     edges = mesh.topology.findLeftBdEdges()

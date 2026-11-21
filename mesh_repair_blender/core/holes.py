@@ -27,8 +27,11 @@ def patch_collisions(before, candidate, patch, mm):
     points = new_v[new_f[ids]]
     lo, hi = points.min(axis=(0, 1)), points.max(axis=(0, 1))
     margin = max(1., float(np.abs(points).max())) * np.finfo(np.float32).eps * 8
-    tri = new_v[new_f]
-    nearby = np.all(tri.max(axis=1) >= lo-margin, axis=1) & np.all(tri.min(axis=1) <= hi+margin, axis=1)
+    nearby = np.empty(len(new_f), dtype=bool)
+    for start in range(0, len(new_f), 65536):
+        block = slice(start, start+65536)
+        tri = new_v[new_f[block]]
+        nearby[block] = np.all(tri.max(axis=1) >= lo-margin, axis=1) & np.all(tri.min(axis=1) <= hi+margin, axis=1)
     region = mn.faceBitSetFromBools(nearby) & candidate.topology.getValidFaces()
     return mm.findSelfCollidingTrianglesBS(mm.MeshPart(candidate, region)) & affected
 
@@ -158,16 +161,16 @@ def fill_simple_holes(mesh, mm, quality_mm, progress=lambda value: None, emit=la
             item['reason'] = 'already_closed'
             continue
         loop = mm.trackRightBoundaryLoop(work.topology, edge)
-        ids = np.fromiter((int(work.topology.org(e)) for e in loop), dtype=np.int32)
-        if len(ids) > max_boundary_edges:
-            item.update(reason='hole_size_limit', boundary_edges=len(ids))
+        if len(loop) > max_boundary_edges:
+            item.update(reason='hole_size_limit', boundary_edges=len(loop))
             report['skipped'] += 1
             continue
-        if len(ids) < 3 or len(np.unique(ids)) != len(ids):
+        ids = [work.topology.org(e) for e in loop]
+        if len(ids) < 3 or len(set(map(int, ids))) != len(ids):
             item['reason'] = 'non_simple_boundary'
             report['skipped'] += 1
             continue
-        pts = mn.getNumpyVerts(work)[ids].astype(float)
+        pts = np.asarray([list(work.points[v]) for v in ids], dtype=float)
         diameter = float(np.linalg.norm(np.ptp(pts, axis=0)))
         flat = planar_boundary(work, mm, loop, pts, quality_mm)
         estimated = len(ids)-2 if flat else int(np.ceil(diameter**2 / target_edge**2 * 2))

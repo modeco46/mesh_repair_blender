@@ -74,6 +74,7 @@ def main():
         progress_file = folder / "timer-progress.jsonl"
         progress_file.write_text('{"type":"progress","value":{"percent":35,"stage":"test"}}\n')
         addon._ACTIVE = {"id": "test", "timer": "test-timer", "progress_file": progress_file,
+                         "event_tail": [], "diagnostics": {},
                          "progress_offset": 0, "progress_pending": b"", "process": SimpleNamespace(poll=lambda: None)}
         modal = addon._MeshRepairModal()
         modal._mesh_repair_job_id = "test"
@@ -81,6 +82,7 @@ def main():
         assert "timer" not in bpy.types.Event.bl_rna.properties
         assert modal.modal(fake_context, SimpleNamespace(type="TIMER")) == {"PASS_THROUGH"}
         assert runtime.progress == 35 and redraws
+        assert addon._ACTIVE["event_tail"][-1]["value"]["percent"] == 35
         addon._ACTIVE = None
     mesh_repair_blender.unregister()
     print("MESH_REPAIR_BLENDER_SMOKE_OK")

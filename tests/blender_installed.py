@@ -35,9 +35,10 @@ def main():
 
     # Invoke the installed operators. Background Blender has no interactive
     # event loop, so deliver the final timer explicitly after each worker exits.
-    assert bpy.ops.mesh_repair.check_selected("INVOKE_DEFAULT") == {"RUNNING_MODAL"}
-    job = addon._ACTIVE
     runtime = bpy.context.window_manager.mesh_repair_runtime
+    status = bpy.ops.mesh_repair.check_selected("INVOKE_DEFAULT")
+    assert status == {"RUNNING_MODAL"}, (status, runtime.stage, runtime.message)
+    job = addon._ACTIVE
     until = time.monotonic()+45
     while not job.get("last_worker_progress") and time.monotonic() < until:
         addon._read_progress(job, runtime)
@@ -49,7 +50,8 @@ def main():
     assert cancelled["status"] == "cancelled" and cancelled["last_progress"]["stage"]
     assert cancelled["elapsed_seconds"] > 0 and not source.hide_get()
 
-    assert bpy.ops.mesh_repair.repair_selected("INVOKE_DEFAULT") == {"RUNNING_MODAL"}
+    status = bpy.ops.mesh_repair.repair_selected("INVOKE_DEFAULT")
+    assert status == {"RUNNING_MODAL"}, (status, runtime.stage, runtime.message)
     job = addon._ACTIVE
     runtime, report = finish(addon, job)
     assert runtime.stage == "Готово", report.get("error", runtime.message)

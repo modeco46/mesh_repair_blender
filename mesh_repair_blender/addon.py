@@ -435,7 +435,7 @@ class MESH_REPAIR_OT_repair_selected(_MeshRepairModal, Operator):
     def poll(cls, context):
         return _ACTIVE is None and any(obj.type == "MESH" for obj in context.selected_objects)
 
-    def invoke(self, context, event):
+    def execute(self, context):
         return _begin(context, "repair", self, self.force_no_sharp)
 
 
@@ -448,7 +448,7 @@ class MESH_REPAIR_OT_check_selected(_MeshRepairModal, Operator):
     def poll(cls, context):
         return _ACTIVE is None and any(obj.type == "MESH" for obj in context.selected_objects)
 
-    def invoke(self, context, event):
+    def execute(self, context):
         return _begin(context, "check", self)
 
 
@@ -519,7 +519,7 @@ class MESH_REPAIR_OT_view_deviation(_MeshRepairModal, Operator):
         return _ACTIVE is None and (heatmap.available(obj) or (
             obj is not None and _LAST_REPAIR is not None and obj == _LAST_REPAIR.get("result_object")))
 
-    def invoke(self, context, event):
+    def execute(self, context):
         obj = _map_target(context)
         if heatmap.active(obj):
             heatmap.hide()

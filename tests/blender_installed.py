@@ -73,6 +73,64 @@ def check_large_repair(addon):
     print('DENSE_INSTALLED_REPAIR_OK', info['triangles'], info['signed_volume_mm3'], deviation, report['elapsed_seconds'])
 
 
+def write_open_relief(path):
+    # Two folds cross the base. Removing base facets at the crossings leaves
+    # small openings for which filling the rim would create an intersection.
+    width, height = 384, 368
+    x, y = np.meshgrid(np.linspace(-8, 8, width), np.linspace(-10, 10, height))
+    z = (1.65+.35*np.cos(.65*x)*np.sin(.47*y)+.19*np.cos(3*np.hypot(x-1, y+.8))
+         +.1*np.cos(3*y+.5*np.sin(2*x))+.28*np.cos(1.3*x+.1*y)*np.cos(.6*y))
+    z -= 2.9*np.exp(-((x+.14)**2/.93**2+(y-.33)**2/1.27**2))
+    z -= 2.8*np.exp(-((x-3.1)**2/1.1**2+(y+1.92)**2/1.1**2))
+    top = np.stack((x, y, z), axis=-1).reshape(-1, 3)
+    base = top.copy()
+    base[:, 2] = 0
+    vertices = np.vstack((top, base)).astype('<f4')
+    ids = np.arange(width*height, dtype=np.int32).reshape(height, width)
+    a = ids[:-1, :-1].ravel()
+    b, c, d = a+1, a+1+width, a+width
+    upper = np.stack((np.stack((a, b, c), axis=1), np.stack((a, c, d), axis=1)), axis=1).reshape(-1, 3)
+    heights = z.ravel()[upper]
+    crossing = np.flatnonzero((heights.min(axis=1) < 0) & (heights.max(axis=1) > 0))
+    centers = top[upper[crossing], :2].mean(axis=1)
+    holes = [crossing[np.argmax(centers @ [np.cos(t), np.sin(t)])] for t in np.arange(12)*2*np.pi/12]
+    bottom = np.delete(upper[:, ::-1]+ids.size, np.unique(holes), axis=0)
+    rim = np.r_[ids[0], ids[1:, -1], ids[-1, -2::-1], ids[-2:0:-1, 0]]
+    nxt = np.roll(rim, -1)
+    faces = np.vstack((upper, bottom, np.stack((nxt, rim, rim+ids.size), axis=1),
+                       np.stack((nxt, rim+ids.size, nxt+ids.size), axis=1)))
+    triangles = np.zeros(len(faces), dtype=[('n', '<f4', (3,)), ('v', '<f4', (3, 3)), ('attr', '<u2')])
+    triangles['v'] = vertices[faces]
+    with path.open('wb') as stream:
+        stream.write(b'Open relief'.ljust(80, b'\0'))
+        stream.write(len(faces).to_bytes(4, 'little'))
+        triangles.tofile(stream)
+
+
+def check_open_relief(addon):
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder)/'open-relief.stl'
+        write_open_relief(path)
+        bpy.ops.wm.stl_import(filepath=str(path))
+    source = bpy.context.active_object
+    bpy.ops.object.select_all(action='DESELECT')
+    source.select_set(True)
+    bpy.context.scene.mesh_repair_settings.quality_mm = .02
+    assert bpy.ops.mesh_repair.repair_selected('INVOKE_DEFAULT') == {'RUNNING_MODAL'}
+    runtime, report = finish(addon, addon._ACTIVE, timeout=420)
+    assert runtime.stage == 'Готово', report.get('error', runtime.message)
+    strategy = report['boundary_band']
+    assert strategy['accepted'] and strategy['method'] == 'oriented_scan', strategy
+    blocks = report['voxel_passes'][-1]['slabs']
+    assert blocks['completed_layers'] == blocks['total_layers'] and blocks['projected_samples'] < blocks['unique_grid_samples']
+    info = report['after']
+    assert info['closed'] and info['topology_valid'] and info['components'] == 1
+    assert info['boundary_loops'] == info['self_intersecting_faces'] == 0
+    assert 505 < info['signed_volume_mm3'] < 510 and 1000 < info['triangles'] < 100_000
+    assert len(runtime.result_object.data.polygons) == info['triangles'] and not runtime.result_object.data.polygons[0].use_smooth
+    print('OPEN_RELIEF_INSTALLED_OK', info['triangles'], info['signed_volume_mm3'], report['elapsed_seconds'])
+
+
 def main():
     package = "bl_ext.user_default.mesh_repair_blender"
     assert package in bpy.context.preferences.addons, "ZIP must be installed and enabled"
@@ -111,7 +169,7 @@ def main():
     job = addon._ACTIVE
     runtime, report = finish(addon, job)
     assert runtime.stage == "Готово", report.get("error", runtime.message)
-    assert report["blender_addon_version"] == "1.4.2" and report["engine_revision"] == "blender-1.4.2"
+    assert report["blender_addon_version"] == "1.5.0" and report["engine_revision"] == "blender-1.5.0"
     assert job["diagnostics"]["after_hole_filling"] == report["after_hole_filling"]
     info = report["after"]
     assert info["closed"] and info["topology_valid"] and info["components"] == 1
@@ -126,6 +184,7 @@ def main():
     assert np.array_equal(actual.reshape(-1, 3), faces)
     print("INSTALLED_REPAIR_OK", info["triangles"], info["signed_volume_mm3"], report["elapsed_seconds"])
     check_large_repair(addon)
+    check_open_relief(addon)
 
 
 if __name__ == "__main__":

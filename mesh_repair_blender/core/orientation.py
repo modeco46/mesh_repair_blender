@@ -8,6 +8,7 @@ import time
 import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
+from .compute import component_ids
 
 
 def finite_vertices(verts):
@@ -195,7 +196,7 @@ def orient_closed_components(mesh, mm):
             mesh.topology.flipOrientation()
             return 1
         return 0
-    labels = np.fromiter((int(x) for x in mapping), dtype=np.int32, count=mapping.size())
+    labels = component_ids(mapping)
     closed = np.ones(count, bool)
     edges = mesh.topology.findLeftBdEdges()
     adjacent = np.fromiter((int(mesh.topology.right(e)) for e in edges), dtype=np.int32, count=edges.count())

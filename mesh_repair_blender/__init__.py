@@ -3,7 +3,7 @@
 bl_info = {
     "name": "Mesh Repair",
     "author": "modeco46",
-    "version": (1, 4, 2),
+    "version": (1, 5, 0),
     "blender": (5, 3, 0),
     "location": "3D Viewport > Sidebar > Mesh Repair",
     "description": "Jewelry mesh repair with native CPU parallelism and CUDA",

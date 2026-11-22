@@ -1,6 +1,20 @@
 """Use supported CUDA kernels with a native CPU fallback; report actual choices."""
 from functools import lru_cache
+import ctypes
 import os
+import numpy as np
+
+
+def component_ids(mapping):
+    """Read MeshLib's packed Face2RegionMap into an independent int32 array."""
+    values = mapping.vec_
+    n = len(values)
+    pointer = getattr(values, 'data_pointer', lambda: None)()
+    if n and pointer and getattr(values, 'element_type_byte_size', 0) == 4:
+        view = np.ctypeslib.as_array((ctypes.c_int32*n).from_address(pointer))
+        if all(view[i] == int(values[i]) for i in (0, n//2, n-1)):
+            return view.copy()
+    return np.fromiter((int(x) for x in mapping), dtype=np.int32, count=n)
 
 
 def cpu_count():

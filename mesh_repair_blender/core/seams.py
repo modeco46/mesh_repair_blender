@@ -1,7 +1,66 @@
-"""Close only tiny cracks produced by marching cubes, with a local surface bound."""
+"""Bounded local repairs for dense marching-cubes surfaces."""
+import time
 import numpy as np
 
 from .reduction import triangle_upper_bounds
+
+
+def relax_voxel_patch(mesh, info, collisions, mm, tolerance):
+    """Edit an owned reconstruction's small collision patch, rolling back on failure."""
+    from meshlib import mrmeshnumpy as mn
+    from .engine import valid
+    started = time.monotonic()
+    region = mm.getIncidentVerts(mesh.topology, collisions)
+    mm.expand(mesh.topology, region, 2)
+    faces = mm.getIncidentFaces(mesh.topology, region)
+    if faces.count() > 8192:
+        return None, {'accepted': False, 'reason': 'patch_too_large'}
+    # Include every neighbour used by relaxation. Only the selected central
+    # vertices may move, including when a patch comprises several components.
+    triangles = np.array([[int(v) for v in mesh.topology.getTriVerts(f)] for f in faces], dtype=np.int32)
+    ids, local_faces = np.unique(triangles, return_inverse=True)
+    vertices = np.array([list(mesh.points[mm.VertId(int(v))]) for v in ids], dtype=np.float32)
+    patch = mn.meshFromFacesVerts(local_faces.reshape(-1, 3).astype(np.int32), vertices)
+    if patch.topology.numValidFaces() != len(triangles) or not np.array_equal(mn.getNumpyVerts(patch), vertices):
+        return None, {'accepted': False, 'reason': 'patch_mapping_changed'}
+    selected = np.array([region.test(mm.VertId(int(v))) for v in ids])
+    params = mm.MeshRelaxParams()
+    params.region = mn.vertBitSetFromBools(selected)
+    params.iterations, params.force = 20, .25
+    params.limitNearInitial, params.maxInitialDist = True, .98*tolerance
+    mm.relax(patch, params)
+    original = vertices[selected]
+    moved = mn.getNumpyVerts(patch)[selected]
+    # Corresponding points on each triangle have identical barycentric weights.
+    # No point on either surface can move farther than its most displaced vertex.
+    maximum = float(np.linalg.norm(moved.astype(float)-original, axis=1).max())
+    margin = 256*np.finfo(float).eps*max(1., float(np.abs(original).max()), float(np.abs(moved).max()))
+    proof = {'verified': maximum+margin <= tolerance, 'upper_bound_mm': maximum+margin, 'tolerance_mm': tolerance,
+             'method': 'unchanged_topology_vertex_displacement', 'max_vertex_displacement_mm': maximum}
+    item = {'attempted': True, 'accepted': False, 'method': 'bounded_patch_relax', 'verification': proof,
+            'initial_intersecting_faces': collisions.count(), 'patch_faces': len(triangles), 'tolerance_mm': tolerance}
+    if not proof['verified']:
+        return None, item
+    targets = [mm.VertId(int(v)) for v in ids[selected]]
+
+    def apply(points):
+        for vertex, point in zip(targets, points):
+            mesh.points[vertex] = mm.Vector3f(*point)
+        mesh.updateCaches(region)
+
+    try:
+        apply(moved)
+        remaining = mm.findSelfCollidingTrianglesBS(mm.MeshPart(mesh)).count()
+        after = dict(info, self_intersecting_faces=remaining, signed_volume_mm3=mesh.volume())
+        item['after'] = after
+        if valid(after):
+            item['accepted'] = True
+            return after, item
+        return None, item
+    finally:
+        if not item['accepted']:
+            apply(original)
+        item['elapsed_seconds'] = time.monotonic()-started
 
 
 def close_voxel_handle(mesh, prepared, current, voxel_reference, mm, q, report):

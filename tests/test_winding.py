@@ -16,9 +16,17 @@ def test_partitioned_grid_matches_native_surface_and_sharpening(sharpen):
     params.signDetectionMode = mm.SignDetectionMode.HoleWindingRule
     params.closeHolesInHoleWindingNumber = True
     events = []
+    submitted_layers = []
+    native_kernel = mm.FastWindingNumber(mesh)
+
+    class Kernel:
+        def calcFromGridWithDistances(self, buffer, dims, transform, options, callback):
+            submitted_layers.append(dims.z)
+            native_kernel.calcFromGridWithDistances(buffer, dims, transform, options, callback)
+
     # Both devices implement the same SDK interface. Exercise the grid assembly
     # and its boundary planes even on build machines without a CUDA device.
-    result = winding_slabs(mesh, mm, mm.FastWindingNumber(mesh), params, events.append,
+    result = winding_slabs(mesh, mm, Kernel(), params, events.append,
                            sharpen=sharpen, budget=710)
     if sharpen:
         params.mode = mm.GeneralOffsetParametersMode.Sharpening
@@ -28,6 +36,8 @@ def test_partitioned_grid_matches_native_surface_and_sharpening(sharpen):
     assert valid(diagnostics(result, mm))
     assert events[0]['completed_layers'] == 0 and events[-1]['completed_layers'] == events[-1]['total_layers']
     assert events[-1]['completed_blocks'] == len(events)-1 > 2
+    assert events[-1]['winding_samples'] == events[-1]['unique_grid_samples'] == np.prod(events[-1]['grid'])
+    assert sum(submitted_layers) == events[-1]['total_layers']
     assert result.topology.numValidFaces() == native.topology.numValidFaces()
     assert mm.findMaxDistanceSq(mm.MeshPart(result), mm.MeshPart(native)) < 1e-10
 

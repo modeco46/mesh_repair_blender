@@ -7,10 +7,11 @@ import os
 import tempfile
 import time
 import numpy as np
-from .compute import capabilities, cuda_module
+from .compute import capabilities, component_ids, cuda_module
 
 
 DENSE_WINDING_VOXEL_LIMIT = 64_000_000
+TIMING_PROBE_MIN_CELLS = 30_000_000
 DENSE_MESH_FACES = 1_000_000
 MAX_SIMPLIFICATION_VOLUME_CHANGE = .02
 
@@ -199,7 +200,7 @@ def shell_intersection_split(mesh, mm):
     if not len(pairs):
         return 0, 0
     mapping, _ = mm.MeshComponents.getAllComponentsMap(mm.MeshPart(mesh))
-    labels = np.fromiter((int(value) for value in mapping), dtype=np.int64)
+    labels = component_ids(mapping)
     first = np.fromiter((int(pair.aFace) for pair in pairs), dtype=np.int64, count=len(pairs))
     second = np.fromiter((int(pair.bFace) for pair in pairs), dtype=np.int64, count=len(pairs))
     same = int((labels[first] == labels[second]).sum())
@@ -423,10 +424,29 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
             if direct is not None:
                 return direct
     winding = None
+    cpu_winding = None
     cuda = None if settings.disable_cuda else cuda_module()
 
-    def reconstruct(sharpen, step, probe=False, stage=None, span=None, winding_beta=2.0, deadline=None):
-        nonlocal winding, cuda
+    band_plan = None
+    prepared = report.get('after_hole_filling', {})
+    if (not closed and not settings.restore_sharp_edges and cells >= TIMING_PROBE_MIN_CELLS
+            and cells > DENSE_WINDING_VOXEL_LIMIT
+            and prepared.get('components') == 1 and prepared.get('topology_valid')):
+        from .winding import hole_field_boxes
+        try:
+            band_plan = hole_field_boxes(mesh, mm, settings.quality_mm)
+        except (RuntimeError, MemoryError) as exc:
+            report['boundary_band'] = {'probe_matched': False, 'fallback_reason': str(exc)}
+    band_boxes = None
+    use_scan = False
+    if band_plan is not None:
+        band_boxes, band_info = band_plan
+        report['boundary_band'] = band_info
+        band_info['probe_matched'] = False
+
+    def reconstruct(sharpen, step, probe=False, stage=None, span=None, winding_beta=2.0, deadline=None,
+                    boxes=None, reference_probe=False, scan=False, probe_signs=None):
+        nonlocal winding, cuda, cpu_winding
         params = mm.GeneralOffsetParameters() if sharpen else mm.OffsetParameters()
         params.voxelSize = step
         params.signDetectionMode = mm.SignDetectionMode.HoleWindingRule
@@ -458,14 +478,20 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
             params.mode = mm.GeneralOffsetParametersMode.Sharpening
         operation = mm.generalOffsetMesh if sharpen else mm.mcOffsetMesh if streaming else mm.offsetMesh
         backend = 'sharpening' if sharpen else 'marching_cubes_by_parts' if streaming else 'smooth_openvdb'
-        slabbed = params.fwn is not None and (streaming or sharpen)
+        slabbed = (params.fwn is not None and (streaming or sharpen)) or boxes is not None or reference_probe
         device = ('cuda_winding_with_cpu_marching_cubes' if slabbed else 'cuda_winding_with_cpu_openvdb') if params.fwn is not None else 'cpu_native_parallel'
+        if scan and params.fwn is not None:
+            device = 'cpu_oriented_scan_with_cuda'
         report['compute_device'] = device
         item = {'probe': probe, 'sharpening': sharpen, 'voxel_size_mm': step, 'compute_device': device,
                 'timing': timing, 'backend': backend, 'streaming': streaming,
                 'grid_cells': grid_cells, 'cpu_closed_surface_band': narrow_band, 'winding_beta': winding_beta}
-        if slabbed:
-            item['field_evaluation'] = 'bounded_cuda_slabs'
+        if scan:
+            item['field_evaluation'] = 'oriented_scan_with_full_hole_boxes'
+        elif boxes is not None:
+            item['field_evaluation'] = 'surface_band_with_full_hole_boxes'
+        elif slabbed:
+            item['field_evaluation'] = 'bounded_cuda_slabs' if winding is not None else 'full_cpu_field'
         elif narrow_band:
             item['field_evaluation'] = 'closed_cpu_surface_band'
         report['voxel_passes'].append(item)
@@ -482,7 +508,18 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
                         tracker.checkpoint({'voxel_pass': dict(item)})
                         callback(.90*block['completed_layers']/block['total_layers'])
 
-                    return winding_slabs(mesh, mm, winding, params, completed, sharpen=sharpen, deadline=deadline)
+                    if winding is None and cpu_winding is None:
+                        cpu_winding = mm.FastWindingNumber(mesh)
+                    kernel = winding if winding is not None else cpu_winding
+                    if scan:
+                        from .scan_field import scan_surface
+                        return scan_surface(mesh, mm, kernel, params, boxes, completed, report['acceleration'],
+                                            probe_signs=probe_signs)
+                    options = {'boundary_boxes': boxes} if boxes is not None else {}
+                    if probe_signs is not None:
+                        options['probe_signs'] = probe_signs
+                    return winding_slabs(mesh, mm, kernel, params, completed,
+                                         sharpen=sharpen, deadline=deadline, **options)
                 result = operation(mm.MeshPart(mesh), 0, params)
                 if narrow_band and not result.topology.isClosed():
                     item['closed_surface_band_fallback'] = True
@@ -494,6 +531,9 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
                     result = operation(mm.MeshPart(mesh), 0, params)
                 return result
             except (RuntimeError, MemoryError) as exc:
+                from .scan_field import ScanUnavailable
+                if isinstance(exc, ScanUnavailable):
+                    raise
                 if deadline is not None and time.monotonic() >= deadline:
                     raise TimeoutError('Уточнение winding остановлено по лимиту времени. '
                                        'Подробности неудачного ремонта сохранены в JSON-отчёте.') from exc
@@ -505,6 +545,13 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
                 item.update(cuda_error=str(exc), field_evaluation='full_cpu_field')
                 tracker.checkpoint({'voxel_pass': dict(item)})
                 emit('Повтор после ошибки CUDA: compute_device=cpu_native_parallel.')
+                if boxes is not None:
+                    raise
+                if reference_probe:
+                    # A native one-shot retry would leave the probe sign array
+                    # unwritten. Recompute the complete probe on CPU instead.
+                    cpu_winding = mm.FastWindingNumber(mesh)
+                    return winding_slabs(mesh, mm, cpu_winding, params, completed, probe_signs=probe_signs)
                 return operation(mm.MeshPart(mesh), 0, params)
         finally:
             item['elapsed_seconds'] = time.monotonic()-started
@@ -512,35 +559,99 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
 
     # A timing-only coarse pass still rebuilds structures for every input
     # triangle. It cannot change the ordinary (non-sharpening) result.
-    skip_probe = (large_source or folded_rims) and not settings.restore_sharp_edges
-    if cells >= 30e6 and skip_probe:
-        report['voxel_estimate'].update(method='bbox_and_surface_area',
-                                        probe_skipped='closed_fixed_rims' if folded_rims else 'dense_input')
-    if cells >= 30e6 and not skip_probe:
+    skip_probe = (large_source or folded_rims) and not settings.restore_sharp_edges and band_plan is None
+    def calibrate():
+        nonlocal band_boxes, use_scan, estimated_seconds
         # Bound the probe itself for very fine grids. Total cells estimate work,
         # not peak memory of the layer-wise CPU/CUDA implementation.
-        probe_factor = max(4, math.ceil((cells/4_000_000)**(1/3)))
+        probe_budget = 1_000_000 if band_plan is not None else 4_000_000
+        probe_factor = max(4, math.ceil((cells/probe_budget)**(1/3)))
         probe_step = settings.quality_mm*probe_factor
         probe_grid = grid_for(probe_step)
         probe_cells = float(probe_grid[0])*probe_grid[1]*probe_grid[2]
+        full_signs = None
+        if band_plan is not None:
+            band_info['probe_step_mm'] = probe_step
+            probe_grid_spec = mm.calcOriginAndDimensions(mesh.computeBoundingBox(), probe_step)
+            full_signs = np.empty(tuple(reversed(list(probe_grid_spec.dimensions))), dtype=bool)
         started_probe = time.monotonic()
-        probe_mesh = reconstruct(False, probe_step, probe=True,
-                                 stage=f'Оценка времени (шаг ×{probe_factor})', span=(41, 42))
+        probe_stage = f'Оценка времени (шаг ×{probe_factor})'
+        probe_mesh = reconstruct(False, probe_step, probe=True, stage=probe_stage, span=(41, 42),
+                                 reference_probe=band_plan is not None, probe_signs=full_signs)
         probe_seconds = time.monotonic()-started_probe
         output_triangles = probe_mesh.topology.numValidFaces()*probe_factor**2
+        if band_plan is not None:
+            from .winding import compare_probe_surfaces
+            from .scan_field import guard_probe_disagreements
+            scan_signs = np.empty_like(full_signs)
+            for method in ('oriented_scan', 'guarded_winding'):
+                scan = method == 'oriented_scan'
+                # A failed scan may only add conservative exact-field regions,
+                # never reduce the guard around an original rim.
+                try:
+                    candidate_boxes = band_boxes
+                    for attempt in range(2 if scan else 1):
+                        band_started = time.monotonic()
+                        trial = reconstruct(False, probe_step, probe=True, stage=probe_stage+' в полосе',
+                                            span=(41, 42), boxes=candidate_boxes, scan=scan,
+                                            probe_signs=scan_signs if scan else None)
+                        band_seconds = time.monotonic()-band_started
+                        comparison = compare_probe_surfaces(probe_mesh, trial, mm, probe_step, settings.quality_mm)
+                        del trial
+                        band_info.setdefault('comparisons', []).append(dict(comparison, method=method))
+                        if comparison['probe_matched']:
+                            band_info.update(comparison, method=method)
+                            band_boxes, use_scan, probe_seconds = candidate_boxes, scan, band_seconds
+                            break
+                        if not scan or attempt:
+                            break
+                        candidate_boxes = guard_probe_disagreements(full_signs, scan_signs, probe_grid_spec,
+                                                                    probe_step, band_boxes)
+                        if candidate_boxes is None:
+                            break
+                        band_info['additional_guard_boxes'] = len(candidate_boxes)-len(band_boxes)
+                    if band_info['probe_matched']:
+                        break
+                except (RuntimeError, MemoryError) as exc:
+                    band_info.setdefault('probe_errors', {})[method] = str(exc)
+            if not band_info['probe_matched']:
+                band_boxes = None
+            del full_signs, scan_signs
+            tracker.checkpoint({'boundary_band': dict(band_info)})
         del probe_mesh
-        eta = estimated_seconds = probe_seconds*cells/probe_cells
-        report['voxel_estimate'].update(estimated_seconds=eta, probe_seconds=probe_seconds, probe_cells=probe_cells,
+        report['voxel_estimate'].update(probe_seconds=probe_seconds, probe_cells=probe_cells,
                                        probe_factor=probe_factor, estimated_output_triangles=output_triangles)
-        emit(f'Оценка только воксельного расчёта по пробе (шаг ×{probe_factor}): ≈ {eta:,.0f} с; '
-             f'промежуточная поверхность ≈ {output_triangles:,} треугольников. '
-             'Проверка и упрощение требуют дополнительного времени.')
-        if eta > settings.voxel_warn_seconds:
-            message = (f'Оценка воксельного расчёта: около {eta/60:.0f} мин при допуске '
-                       f'{settings.quality_mm:g} мм, без проверки и упрощения. '
-                       'Оценка приблизительная; расчёт продолжается с выбранным допуском.')
-            report['warnings'].append(message)
-            emit(message)
+        if use_scan:
+            # The expensive projections scale with the surface, not the
+            # bounding volume. Report real layer progress instead of a cubic ETA.
+            report['voxel_estimate']['method'] = 'validated_oriented_scan'
+            emit(f'Проверено сканирование поверхности. Ожидается около {output_triangles:,} промежуточных граней.')
+        else:
+            estimated_seconds = probe_seconds*cells/probe_cells
+            report['voxel_estimate']['estimated_seconds'] = estimated_seconds
+            emit(f'Оценка воксельного расчёта по пробе (шаг ×{probe_factor}): ≈ {estimated_seconds:,.0f} с. '
+                 f'Промежуточная поверхность ≈ {output_triangles:,} треугольников.')
+            if estimated_seconds > settings.voxel_warn_seconds:
+                message = (f'Оценка воксельного расчёта: около {estimated_seconds/60:.0f} мин при допуске '
+                           f'{settings.quality_mm:g} мм, без проверки и упрощения.')
+                report['warnings'].append(message)
+                emit(message)
+
+    if cells >= TIMING_PROBE_MIN_CELLS:
+        if skip_probe:
+            report['voxel_estimate'].update(method='bbox_and_surface_area',
+                                            probe_skipped='closed_fixed_rims' if folded_rims else 'dense_input')
+        else:
+            try:
+                calibrate()
+            except (RuntimeError, MemoryError) as exc:
+                if band_plan is None:
+                    raise
+                band_boxes, use_scan = None, False
+                band_info.update(probe_matched=False, fallback_reason=str(exc))
+                report['voxel_estimate'].update(method='bbox_and_surface_area', probe_skipped='reference_probe_failed')
+                tracker.checkpoint({'boundary_band': dict(band_info)})
+                emit('Контрольная проба не завершилась. Полный расчёт при выбранном шаге.')
 
     use_sharp = False
     if settings.restore_sharp_edges:
@@ -570,7 +681,7 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
             report['warnings'].append(warning)
             emit(warning)
     def full_result(sharpen, winding_beta=2.0, deadline=None):
-        result = reconstruct(sharpen, settings.quality_mm, winding_beta=winding_beta,
+        result = reconstruct(sharpen, settings.quality_mm, winding_beta=winding_beta, boxes=band_boxes, scan=use_scan,
                              stage='Уточнение воксельной поверхности' if winding_beta > 2 else None, deadline=deadline)
         if translation is not None:
             result.transform(mm.AffineXf3f.translation(translation))
@@ -582,6 +693,18 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
             tracker.update(65, 'Проверка пересечений воксельной поверхности')
             collisions = mm.findSelfCollidingTrianglesBS(mm.MeshPart(result))
             check['self_intersecting_faces'] = collisions.count()
+            if (check['closed'] and check['topology_valid'] and 0 < collisions.count() <=
+                    min(64, max(settings.local_fix_max_faces, int(check['triangles']*settings.local_fix_fraction)))):
+                from .seams import relax_voxel_patch
+                tracker.update(65, 'Локальное исправление воксельной поверхности')
+                try:
+                    patched, item = relax_voxel_patch(result, check, collisions, mm, settings.quality_mm*.25)
+                except (RuntimeError, MemoryError) as exc:
+                    patched, item = None, {'accepted': False, 'error': str(exc)}
+                report['voxel_patch'] = item
+                if patched is not None:
+                    report['reconstruction_local_repair'] = item
+                    return result, patched
         else:
             check = diagnostics(result, mm)
             if not sharpen and not valid(check):
@@ -610,7 +733,31 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
                                                                       initial_collisions=collisions)
         return result, check
 
-    result, check = full_result(use_sharp)
+    try:
+        result, check = full_result(use_sharp)
+    except (RuntimeError, MemoryError) as exc:
+        if band_boxes is None:
+            raise
+        band_info['fallback_reason'] = str(exc)
+        result, check = None, None
+    if band_boxes is not None:
+        coarse_volume = band_info['full_probe_volume_mm3']
+        # A full-grid probe also guards against a whole body disappearing.
+        # Small features may legitimately differ at the coarse resolution.
+        volume_margin = min(.1*abs(coarse_volume), 2*mesh.area()*band_info['probe_step_mm'])
+        accepted = check is not None and valid(check) and abs(check['signed_volume_mm3']-coarse_volume) <= volume_margin
+        band_info['accepted'] = accepted
+        if not accepted:
+            band_info.setdefault('fallback_reason', 'invalid_surface_or_volume')
+            band_info['rejected_surface'] = check
+            for key in ('reconstruction_artifacts', 'reconstruction_seams', 'reconstruction_local_repair', 'voxel_patch'):
+                if key in report:
+                    band_info[key] = report.pop(key)
+            del result
+            band_boxes = None
+            use_scan = False
+            emit('Контроль узкой полосы не пройден. Полный расчёт при том же шаге.')
+            result, check = full_result(False)
     if use_sharp:
         sharp['full_validation'] = check
     if use_sharp and not valid(check):
@@ -1331,7 +1478,7 @@ def _run(source, settings, emit, progress, folder, report=None, *, array_output=
     started = time.monotonic()
     if report is None:
         report = {}
-    report.update({'version': '1.0.0', 'engine_revision': 'blender-1.4.2',
+    report.update({'version': '1.0.0', 'engine_revision': 'blender-1.5.0',
               'settings': asdict(settings), 'source': str(source),
               'units': 'mm', 'tolerance_certified': False, 'warnings': [], 'steps': [],
               'compute_device': 'cpu_native_parallel', 'acceleration': capabilities(settings.disable_cuda)})

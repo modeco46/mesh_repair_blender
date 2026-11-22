@@ -3,7 +3,7 @@ from pathlib import Path
 import time
 import numpy as np
 from .engine import Progress, diagnostics
-from .compute import capabilities
+from .compute import capabilities, component_ids
 from .orientation import finite_vertices, prepare_orientation
 
 
@@ -47,7 +47,7 @@ def shell_summary(mesh, mm, *, component_count=None):
         box = mesh.computeBoundingBox()
         minimum[0], maximum[0] = list(box.min), list(box.max)
     else:
-        groups = np.fromiter((int(x) for x in mapping), dtype=np.int32, count=mapping.size())
+        groups = component_ids(mapping)
         sizes = np.bincount(groups, minlength=count)
         adjacent = np.fromiter((int(mesh.topology.right(e)) for e in boundary), dtype=np.int32, count=boundary.count())
         open_edges = np.bincount(groups[adjacent], minlength=count)

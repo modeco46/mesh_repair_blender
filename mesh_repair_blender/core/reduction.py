@@ -6,8 +6,10 @@ triangle (both directions), rather than merely checking distances at mesh vertic
 import math
 import os
 import ctypes
+import io
+import struct
 import numpy as np
-from .compute import Projector, cpu_count
+from .compute import Projector, component_ids, cpu_count
 
 
 def prepare_reduction(mesh, mm, *, components=None):
@@ -28,7 +30,7 @@ def prepare_reduction(mesh, mm, *, components=None):
         small = candidate.topology.numValidFaces() < 50
         return {'candidate': None if small else candidate, 'protected': candidate if small else None,
                 'protected_count': int(small)}
-    groups = np.fromiter((int(x) for x in mapping), dtype=np.int32, count=mapping.size())
+    groups = component_ids(mapping)
     sizes = np.bincount(groups, minlength=count)
     small = mn.faceBitSetFromBools(sizes[groups] < 50)
     protected_count = int(np.count_nonzero(sizes < 50))
@@ -137,6 +139,34 @@ def propose_reduction(mesh, mm, settings, progress, error_scale=1.0, *, preserve
     candidate.pack()
     return candidate, stages
 
+def _crease_endpoints(topology, creases, mm, mn):
+    edges = 2*np.flatnonzero(mn.getNumpyBitSet(creases))
+    edge_count = topology.edgeSize()
+    vertex_count, face_count = topology.vertSize(), topology.faceSize()
+    # MeshLib's binary topology stores four int32 fields per halfedge
+    # (next, prev, org, left), then the edge-per-vertex and edge-per-face maps.
+    # Bulk reads pay off on dense ridges; cap the temporary buffer on large jobs.
+    size = 12+16*edge_count+4*(vertex_count+face_count)
+    if len(edges) >= 4096 and size <= 256*1024**2:
+        try:
+            stream = io.BytesIO()
+            topology.write(stream)
+            data = stream.getbuffer()
+            vertex_header = 4+16*edge_count
+            face_header = vertex_header+4+4*vertex_count
+            if len(data) == size and all(struct.unpack_from('<I', data, pos)[0] == count for pos, count in
+                                         ((0, edge_count), (vertex_header, vertex_count), (face_header, face_count))):
+                origins = np.frombuffer(data, dtype='<i4', count=4*edge_count, offset=4)[2::4]
+                first, second = origins[edges], origins[edges+1]
+                if all(int(topology.org(mm.EdgeId(int(edges[i])))) == first[i] and
+                       int(topology.dest(mm.EdgeId(int(edges[i])))) == second[i]
+                       for i in (0, len(edges)//2, len(edges)-1)):
+                    return first, second
+        except (AttributeError, RuntimeError, MemoryError, OSError):
+            pass
+    first = np.fromiter((int(topology.org(mm.EdgeId(int(e)))) for e in edges), dtype=np.int32, count=len(edges))
+    second = np.fromiter((int(topology.dest(mm.EdgeId(int(e)))) for e in edges), dtype=np.int32, count=len(edges))
+    return first, second
 
 
 def crease_corners(mesh, creases, mm, mn):
@@ -149,9 +179,7 @@ def crease_corners(mesh, creases, mm, mn):
     verts = mn.getNumpyVerts(mesh)
     if not creases.count():
         return mm.VertBitSet()
-    edges = np.fromiter((int(e)*2 for e in creases), dtype=np.int32, count=creases.count())
-    first = np.fromiter((int(mesh.topology.org(mm.EdgeId(int(e)))) for e in edges), dtype=np.int32, count=len(edges))
-    second = np.fromiter((int(mesh.topology.dest(mm.EdgeId(int(e)))) for e in edges), dtype=np.int32, count=len(edges))
+    first, second = _crease_endpoints(mesh.topology, creases, mm, mn)
     delta = verts[second].astype(float)-verts[first]
     length = np.linalg.norm(delta,axis=1)
     direction = delta/np.maximum(length[:,None],np.finfo(float).tiny)

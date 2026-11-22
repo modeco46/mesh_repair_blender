@@ -5,7 +5,7 @@ from meshlib import mrmeshpy as mm, mrmeshnumpy as mn
 
 from mesh_repair_blender.core import engine, reduction
 from mesh_repair_blender.core.engine import Settings, Progress, diagnostics, valid
-from mesh_repair_blender.core.seams import fill_voxel_seams
+from mesh_repair_blender.core.seams import fill_voxel_seams, relax_voxel_patch
 
 
 def creased_sphere(scale=.1):
@@ -13,6 +13,23 @@ def creased_sphere(scale=.1):
     vertices = mn.getNumpyVerts(mesh).copy()
     vertices[np.argmax(vertices[:, 0])] += [0, .6, 0]
     return mn.meshFromFacesVerts(mn.getNumpyFaces(mesh.topology), vertices*scale)
+
+
+@pytest.mark.parametrize('reject', [False, True])
+def test_patch_relaxation_validates_the_entire_mesh_and_rolls_back(monkeypatch, reject):
+    mesh = creased_sphere()
+    before = diagnostics(mesh, mm)
+    faces = mm.findSelfCollidingTrianglesBS(mm.MeshPart(mesh))
+    vertices = mn.getNumpyVerts(mesh).copy()
+    if reject:
+        monkeypatch.setattr(mm, 'findSelfCollidingTrianglesBS', lambda part: faces)
+    result, item = relax_voxel_patch(mesh, before, faces, mm, .015*.25)
+    if reject:
+        assert result is None and not item['accepted']
+        np.testing.assert_array_equal(mn.getNumpyVerts(mesh), vertices)
+    else:
+        assert item['accepted'] and valid(result) and valid(diagnostics(mesh, mm))
+        assert np.linalg.norm(mn.getNumpyVerts(mesh)-vertices, axis=1).max() <= item['verification']['upper_bound_mm']
 
 
 def test_large_streamed_grid_is_not_rejected_by_dense_cell_count(monkeypatch):

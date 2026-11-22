@@ -3,6 +3,7 @@ import pytest
 from meshlib import mrmeshpy as mm, mrmeshnumpy as mn
 
 from mesh_repair_blender.core import engine, reduction
+from mesh_repair_blender.core.compute import component_ids
 from mesh_repair_blender.core.engine import Settings, Progress, diagnostics, valid
 
 
@@ -46,6 +47,22 @@ def test_planar_finish_preserves_small_separate_shells():
     assert report['planar_finish']['accepted']
     assert diagnostics(result, mm)['components'] == 2
     assert result.topology.numValidFaces() == 24
+
+
+def test_bulk_crease_endpoints_and_component_labels_match_native_ids():
+    mesh = mm.makeTorus(1, .2, 96, 64)
+    mesh.addMesh(mm.makeCube(mm.Vector3f.diagonal(.1), mm.Vector3f.diagonal(4)))
+    mesh.topology.deleteFace(mm.FaceId(15))
+    mesh.topology.deleteFace(mm.FaceId(37))
+    mapping, count = mm.MeshComponents.getAllComponentsMap(mm.MeshPart(mesh))
+    assert count == 2
+    np.testing.assert_array_equal(component_ids(mapping), [int(x) for x in mapping])
+    edges = mesh.topology.findNotLoneUndirectedEdges()
+    first, second = reduction._crease_endpoints(mesh.topology, edges, mm, mn)
+    assert len(first) == edges.count() > 4096
+    directed = [mm.EdgeId(2*int(x)) for x in edges]
+    np.testing.assert_array_equal(first, [int(mesh.topology.org(x)) for x in directed])
+    np.testing.assert_array_equal(second, [int(mesh.topology.dest(x)) for x in directed])
 
 
 def test_final_pass_checks_total_deviation_not_just_its_own_change(monkeypatch):

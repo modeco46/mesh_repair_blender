@@ -2,6 +2,8 @@
 import time
 import numpy as np
 
+from .collisions import region_collisions
+
 
 def patch_collisions(before, candidate, patch, mm):
     """Check changed faces and their spatial neighbours, including moved rim faces.
@@ -27,12 +29,18 @@ def patch_collisions(before, candidate, patch, mm):
     points = new_v[new_f[ids]]
     lo, hi = points.min(axis=(0, 1)), points.max(axis=(0, 1))
     margin = max(1., float(np.abs(points).max())) * np.finfo(np.float32).eps * 8
-    nearby = np.empty(len(new_f), dtype=bool)
-    for start in range(0, len(new_f), 65536):
-        block = slice(start, start+65536)
-        tri = new_v[new_f[block]]
-        nearby[block] = np.all(tri.max(axis=1) >= lo-margin, axis=1) & np.all(tri.min(axis=1) <= hi+margin, axis=1)
+    # Test vertex coordinates once per axis. A triangle is separated from the
+    # edit box only when all three vertices are on one side of the same plane.
+    nearby = np.ones(len(new_f), dtype=bool)
+    a, b, c = new_f.T
+    for axis in range(3):
+        above = new_v[:, axis] >= lo[axis]-margin
+        below = new_v[:, axis] <= hi[axis]+margin
+        nearby &= (above[a] | above[b] | above[c]) & (below[a] | below[b] | below[c])
     region = mn.faceBitSetFromBools(nearby) & candidate.topology.getValidFaces()
+    hits = region_collisions(candidate, region, mm)
+    if hits is not None:
+        return hits & affected
     return mm.findSelfCollidingTrianglesBS(mm.MeshPart(candidate, region)) & affected
 
 

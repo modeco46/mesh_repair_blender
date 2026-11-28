@@ -340,14 +340,20 @@ def try_closed_level_set(mesh, mm, settings, tracker, report, emit, translation)
         if translation is not None:
             candidate.transform(mm.AffineXf3f.translation(translation))
         tracker.update(63, 'Проверка поверхности OpenVDB')
-        after = item['candidate'] = diagnostics(candidate, mm)
-        if not valid(after) or after['components'] != 1:
+        # Most expensive on a dense surface: constructing the collision tree.
+        # Reject open/multibody candidates or changed handles before building it.
+        after = item['candidate'] = dict(topology_info(candidate, mm), self_intersecting_faces=None)
+        if not after['closed'] or not after['topology_valid'] or after['components'] != 1:
             item['reason'] = 'invalid_level_set_surface'
             return None
         original = {'vertices': mesh.topology.numValidVerts(), 'triangles': mesh.topology.numValidFaces(),
                     'components': 1}
         if not same_closed_surface_topology(original, after):
             item['reason'] = 'level_set_genus_changed'
+            return None
+        after['self_intersecting_faces'] = mm.findSelfCollidingTrianglesBS(mm.MeshPart(candidate)).count()
+        if not valid(after):
+            item['reason'] = 'invalid_level_set_surface'
             return None
         # A valid solid alone does not prove that VDB kept a thin detail or a
         # folded sheet. Measure every vertex in both directions at the same q.
@@ -431,7 +437,7 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
     prepared = report.get('after_hole_filling', {})
     if (not closed and not settings.restore_sharp_edges and cells >= TIMING_PROBE_MIN_CELLS
             and cells > DENSE_WINDING_VOXEL_LIMIT
-            and prepared.get('components') == 1 and prepared.get('topology_valid')):
+            and 1 <= prepared.get('components', 0) <= 256 and prepared.get('topology_valid')):
         from .winding import hole_field_boxes
         try:
             band_plan = hole_field_boxes(mesh, mm, settings.quality_mm)
@@ -504,6 +510,11 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
                     from .winding import winding_slabs
 
                     def completed(block):
+                        if not probe and block.get('completed_blocks', 0) >= 8:
+                            layers = block['completed_layers']
+                            elapsed = time.monotonic()-started
+                            if layers and layers < block['total_layers']:
+                                block['estimated_remaining_layer_seconds'] = elapsed*(block['total_layers']-layers)/layers
                         item['slabs'] = block
                         tracker.checkpoint({'voxel_pass': dict(item)})
                         callback(.90*block['completed_layers']/block['total_layers'])
@@ -518,6 +529,8 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
                     options = {'boundary_boxes': boxes} if boxes is not None else {}
                     if probe_signs is not None:
                         options['probe_signs'] = probe_signs
+                    if winding is not None and not probe and not sharpen and boxes is None and streaming:
+                        options['prefetch'] = True
                     return winding_slabs(mesh, mm, kernel, params, completed,
                                          sharpen=sharpen, deadline=deadline, **options)
                 result = operation(mm.MeshPart(mesh), 0, params)
@@ -626,6 +639,9 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
             # bounding volume. Report real layer progress instead of a cubic ETA.
             report['voxel_estimate']['method'] = 'validated_oriented_scan'
             emit(f'Проверено сканирование поверхности. Ожидается около {output_triangles:,} промежуточных граней.')
+        elif winding is not None and not settings.restore_sharp_edges and probe_seconds < 1.0:
+            report['voxel_estimate']['method'] = 'measured_layer_progress'
+            emit(f'Промежуточная поверхность ≈ {output_triangles:,} граней. Оценка времени по рабочим слоям.')
         else:
             estimated_seconds = probe_seconds*cells/probe_cells
             report['voxel_estimate']['estimated_seconds'] = estimated_seconds
@@ -694,7 +710,7 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
             collisions = mm.findSelfCollidingTrianglesBS(mm.MeshPart(result))
             check['self_intersecting_faces'] = collisions.count()
             if (check['closed'] and check['topology_valid'] and 0 < collisions.count() <=
-                    min(64, max(settings.local_fix_max_faces, int(check['triangles']*settings.local_fix_fraction)))):
+                    min(256, max(settings.local_fix_max_faces, int(check['triangles']*settings.local_fix_fraction)))):
                 from .seams import relax_voxel_patch
                 tracker.update(65, 'Локальное исправление воксельной поверхности')
                 try:
@@ -745,14 +761,43 @@ def sparse_repair(mesh, mm, settings, tracker, report, emit, translation=None):
         # A full-grid probe also guards against a whole body disappearing.
         # Small features may legitimately differ at the coarse resolution.
         volume_margin = min(.1*abs(coarse_volume), 2*mesh.area()*band_info['probe_step_mm'])
-        accepted = check is not None and valid(check) and abs(check['signed_volume_mm3']-coarse_volume) <= volume_margin
-        band_info['accepted'] = accepted
-        if not accepted:
-            band_info.setdefault('fallback_reason', 'invalid_surface_or_volume')
-            band_info['rejected_surface'] = check
+
+        def accepted_surface(info):
+            return info is not None and valid(info) and abs(info['signed_volume_mm3']-coarse_volume) <= volume_margin
+
+        def record_rejection():
+            rejected = {'surface': check}
             for key in ('reconstruction_artifacts', 'reconstruction_seams', 'reconstruction_local_repair', 'voxel_patch'):
                 if key in report:
-                    band_info[key] = report.pop(key)
+                    rejected[key] = band_info[key] = report.pop(key)
+            band_info.setdefault('rejected_passes', []).append(rejected)
+            band_info['rejected_surface'] = check
+
+        # Small open contours in an otherwise valid band mesh can mark a sign
+        # transition beyond its truncation radius. Restore the native field
+        # there and rebuild once, still on the original voxel lattice.
+        if (not use_scan and check is not None and check['topology_valid'] and
+                0 < check['boundary_loops'] <= 32 and abs(check['signed_volume_mm3']-coarse_volume) <= volume_margin):
+            from .winding import seam_field_boxes
+            try:
+                extra_boxes = seam_field_boxes(result, mm, settings.quality_mm, translation)
+            except (RuntimeError, MemoryError):
+                extra_boxes = None
+            if extra_boxes is not None:
+                record_rejection()
+                band_info['seam_guard_boxes'] = len(extra_boxes)
+                emit('Повтор узкой полосы с полным полем в области микротрещин.')
+                del result
+                result, check = None, None
+                try:
+                    band_boxes = np.concatenate((band_boxes, extra_boxes))
+                    result, check = full_result(False)
+                except (RuntimeError, MemoryError) as exc:
+                    band_info['seam_retry_error'] = str(exc)
+        band_info['accepted'] = accepted_surface(check)
+        if not band_info['accepted']:
+            record_rejection()
+            band_info.setdefault('fallback_reason', 'invalid_surface_or_volume')
             del result
             band_boxes = None
             use_scan = False
@@ -1178,6 +1223,10 @@ def simplify_attempts(exported, tmp, mm, settings, tracker, report, emit, workdi
             if candidate is not None:
                 seed = best = candidate, info, item
                 summary['search_stop'] = 'accepted_seed'
+                if (info['triangles'] <= original['triangles']//8 and
+                        item['verification']['max_deviation_mm'] >= .8*target):
+                    summary['search_stop'] = 'dense_seed_near_budget'
+                    break
                 if info['triangles'] <= original['triangles']//2:
                     for _ in range(2):
                         previous = best[1]['triangles']
@@ -1478,7 +1527,7 @@ def _run(source, settings, emit, progress, folder, report=None, *, array_output=
     started = time.monotonic()
     if report is None:
         report = {}
-    report.update({'version': '1.0.0', 'engine_revision': 'blender-1.5.0',
+    report.update({'version': '1.0.0', 'engine_revision': 'blender-1.5.1',
               'settings': asdict(settings), 'source': str(source),
               'units': 'mm', 'tolerance_certified': False, 'warnings': [], 'steps': [],
               'compute_device': 'cpu_native_parallel', 'acceleration': capabilities(settings.disable_cuda)})
@@ -1544,9 +1593,18 @@ def _run(source, settings, emit, progress, folder, report=None, *, array_output=
     emit(f"После согласования: треугольников {info['triangles']:,}; оболочек {info['components']}; дыр {info['boundary_loops']}.")
     from .holes import fill_simple_holes
     before_holes = mesh
+    defer_patches = not dense_input
+    local_limit = max(settings.local_fix_max_faces, int(info['triangles']*settings.local_fix_fraction))
+    if defer_patches and info['boundary_loops'] and before['self_intersecting_faces'] > local_limit:
+        # The original and the oriented/welded work mesh can differ. Decide
+        # from actual prepared geometry; still try local repair after safe caps.
+        prepared_hits = mm.findSelfCollidingTrianglesBS(mm.MeshPart(mesh)).count()
+        info['self_intersecting_faces'] = prepared_hits
+        defer_patches = prepared_hits <= local_limit
     mesh, hole_report = fill_simple_holes(mesh, mm, settings.quality_mm,
-        tracker.callback(18, 30, 'Заполнение простых дыр'), emit, defer_intersections=not dense_input,
+        tracker.callback(18, 30, 'Заполнение простых дыр'), emit, defer_intersections=defer_patches,
         time_budget_seconds=8.0 if dense_input else 60.0)
+    hole_report['deferred_patches_enabled'] = defer_patches
     report['hole_filling'] = hole_report
     tracker.update(30, 'Проверка после заполнения дыр')
     if dense_input:

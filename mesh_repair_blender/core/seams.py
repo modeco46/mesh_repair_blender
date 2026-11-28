@@ -50,7 +50,23 @@ def relax_voxel_patch(mesh, info, collisions, mm, tolerance):
 
     try:
         apply(moved)
-        remaining = mm.findSelfCollidingTrianglesBS(mm.MeshPart(mesh)).count()
+        hits = None
+        if info['triangles'] >= 1_000_000:
+            from .collisions import patch_neighbours, region_collisions
+            # All original collisions are in faces. The only new intersections
+            # can involve faces incident to vertices explicitly edited above.
+            coords = vertices.astype(float)
+            coords[selected] = moved
+            try:
+                nearby = patch_neighbours(mesh, coords[local_faces.reshape(-1, 3)], faces, mm)
+                if nearby is not None:
+                    hits = region_collisions(mesh, nearby, mm)
+            except (RuntimeError, MemoryError):
+                pass
+        item['collision_check'] = 'changed_faces_and_spatial_neighbours' if hits is not None else 'whole_mesh'
+        if hits is None:
+            hits = mm.findSelfCollidingTrianglesBS(mm.MeshPart(mesh))
+        remaining = hits.count()
         after = dict(info, self_intersecting_faces=remaining, signed_volume_mm3=mesh.volume())
         item['after'] = after
         if valid(after):

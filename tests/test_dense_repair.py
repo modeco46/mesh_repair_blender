@@ -109,6 +109,7 @@ def test_rejected_dense_seeds_limit_full_mesh_visits(monkeypatch):
 
 def test_closed_band_rejects_artificial_tunnels(monkeypatch):
     monkeypatch.setattr(mm, 'doubleOffsetMesh', lambda *args: mm.makeTorus(1, .2, 24, 12))
+    monkeypatch.setattr(mm, 'findSelfCollidingTrianglesBS', lambda *args: pytest.fail('already rejected on genus'))
     report = {'voxel_passes': []}
     result = engine.try_closed_level_set(cube(), mm, Settings(.02), Progress(lambda _: None),
                                          report, lambda _: None, None)
@@ -161,3 +162,40 @@ def test_inward_open_body_is_reoriented_after_closing(tmp_path, monkeypatch):
     assert report['hole_filling']['closed_orientation_corrections'] == 1
     assert report['algorithm'] == 'surface_repair' and 'voxel_passes' not in report
     assert report['after']['signed_volume_mm3'] == pytest.approx(1)
+
+
+def test_dense_seed_near_budget_stops_after_measured_acceptance(monkeypatch):
+    monkeypatch.setattr(engine, 'DENSE_MESH_FACES', 10)
+    original, seed = cube(.1), cube()
+    monkeypatch.setattr(reduction, 'propose_reduction', lambda *a, **kw: (seed, [{}]))
+    monkeypatch.setattr(reduction, 'measured_distance', lambda *args: .018)
+    report = {'after': diagnostics(original, mm), 'steps': [], 'warnings': []}
+    result = engine.simplify_attempts(original, None, mm, Settings(.02, simplify_curved=True),
+                                      Progress(lambda _: None), report, lambda _: None, None)
+    assert result is seed
+    summary = report['simplification']
+    assert len(summary['attempts']) == 1
+    assert summary['search_stop'] == 'dense_seed_near_budget'
+
+
+def test_many_existing_intersections_use_safe_caps_once(tmp_path, monkeypatch):
+    from mesh_repair_blender.core import holes
+    source = cube()
+    source.addMesh(mm.makeCube(mm.Vector3f.diagonal(.8), mm.Vector3f.diagonal(.45)))
+    source.topology.deleteFace(mm.FaceId(0))
+    src = tmp_path/'source.stl'
+    mm.saveMesh(source, src)
+    calls = []
+    fill = holes.fill_simple_holes
+
+    def tracked(*args, **kwargs):
+        calls.append(kwargs.get('defer_intersections', False))
+        return fill(*args, **kwargs)
+
+    monkeypatch.setattr(holes, 'fill_simple_holes', tracked)
+    settings = Settings(.07, restore_sharp_edges=False, disable_cuda=True, local_fix_max_faces=1, local_fix_fraction=0)
+    report = engine.run(src, settings=settings, work_dir=tmp_path/'job',
+                        array_output=(tmp_path/'v.npy', tmp_path/'f.npy'))
+    assert calls == [False]
+    assert report['prepared']['self_intersecting_faces'] > 1
+    assert valid(report['after'])

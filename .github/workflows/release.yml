@@ -27,5 +27,5 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*.zip
-          prerelease: ${{ contains(fromJSON('["v1.4.0","v1.4.1","v1.5.0"]'), github.ref_name) }}
-          make_latest: ${{ !contains(fromJSON('["v1.4.0","v1.4.1","v1.5.0"]'), github.ref_name) }}
+          prerelease: ${{ contains(fromJSON('["v1.4.0","v1.4.1","v1.5.1"]'), github.ref_name) }}
+          make_latest: ${{ !contains(fromJSON('["v1.4.0","v1.4.1","v1.5.1"]'), github.ref_name) }}

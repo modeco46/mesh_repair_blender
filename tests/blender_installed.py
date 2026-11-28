@@ -169,7 +169,7 @@ def main():
     job = addon._ACTIVE
     runtime, report = finish(addon, job)
     assert runtime.stage == "Готово", report.get("error", runtime.message)
-    assert report["blender_addon_version"] == "1.5.0" and report["engine_revision"] == "blender-1.5.0"
+    assert report["blender_addon_version"] == "1.5.1" and report["engine_revision"] == "blender-1.5.1"
     assert job["diagnostics"]["after_hole_filling"] == report["after_hole_filling"]
     info = report["after"]
     assert info["closed"] and info["topology_valid"] and info["components"] == 1

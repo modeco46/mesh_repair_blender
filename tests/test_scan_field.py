@@ -105,3 +105,99 @@ def test_optimized_route_and_fallback_keep_the_requested_step(monkeypatch, failu
         assert plan['accepted'] == (failure == 'none')
     if failure != 'none':
         assert report['voxel_passes'][-1].get('field_evaluation') != 'oriented_scan_with_full_hole_boxes'
+
+
+def test_multibody_band_keeps_both_bodies(monkeypatch):
+    mesh = punctured_sphere()
+    second = punctured_sphere()
+    second.transform(mm.AffineXf3f.translation(mm.Vector3f(1.8, 0, 0)))
+    mesh.addMesh(second)
+    monkeypatch.setattr(engine, 'DENSE_WINDING_VOXEL_LIMIT', 1)
+    monkeypatch.setattr(engine, 'TIMING_PROBE_MIN_CELLS', 1)
+    report = {'warnings': [], 'acceleration': {'cuda_disabled': True}, 'after_hole_filling': engine.topology_info(mesh, mm)}
+    q = .04
+    out = engine.sparse_repair(mesh, mm, engine.Settings(q, restore_sharp_edges=False, disable_cuda=True),
+                               engine.Progress(lambda _: None), report, lambda _: None)
+    assert report['boundary_band']['accepted']
+    after = engine.diagnostics(out, mm)
+    assert engine.valid(after) and after['components'] == 2
+    params = mm.OffsetParameters()
+    params.voxelSize = q
+    params.closeHolesInHoleWindingNumber = True
+    direct = winding.winding_slabs(mesh, mm, mm.FastWindingNumber(mesh), params, lambda _: None)
+    assert after['triangles'] == direct.topology.numValidFaces()
+    assert mm.findMaxDistanceSq(mm.MeshPart(out), mm.MeshPart(direct)) < 1e-10
+
+
+@pytest.mark.parametrize('retry_ok', [True, False])
+def test_band_microcrack_retries_once_in_input_coordinates(monkeypatch, retry_ok):
+    from mesh_repair_blender.core import seams
+    mesh = punctured_sphere()
+    q = .035
+    translation = mm.Vector3f(13, -41, 7)
+    monkeypatch.setattr(engine, 'DENSE_WINDING_VOXEL_LIMIT', 1)
+    monkeypatch.setattr(engine, 'TIMING_PROBE_MIN_CELLS', 1)
+    monkeypatch.setattr(seams, 'fill_voxel_seams', lambda surface, *args: (surface, {'accepted': False}))
+
+    def no_scan(*args, **kwargs):
+        raise scan_field.ScanUnavailable('test native band')
+
+    monkeypatch.setattr(scan_field, 'scan_surface', no_scan)
+    native = winding.winding_slabs
+    fine_boxes = []
+    seam_centers = []
+
+    def slabs(mesh, sdk, kernel, params, completed, **kw):
+        surface = native(mesh, sdk, kernel, params, completed, **kw)
+        boxes = kw.get('boundary_boxes')
+        if params.voxelSize == pytest.approx(q) and boxes is not None:
+            fine_boxes.append(boxes.copy())
+            if len(fine_boxes) == 1 or not retry_ok:
+                face = mm.FaceId(surface.topology.faceSize()//2)
+                seam_centers.append(list(surface.triCenter(face)))
+                surface.topology.deleteFace(face)
+        return surface
+
+    monkeypatch.setattr(winding, 'winding_slabs', slabs)
+    report = {'warnings': [], 'acceleration': {'cuda_disabled': True}, 'after_hole_filling': engine.topology_info(mesh, mm)}
+    out = engine.sparse_repair(mesh, mm, engine.Settings(q, restore_sharp_edges=False, disable_cuda=True),
+                               engine.Progress(lambda _: None), report, lambda _: None, translation)
+    plan = report['boundary_band']
+    assert len(fine_boxes) == 2 and plan['seam_guard_boxes'] == 1
+    lo, hi = fine_boxes[-1][-1]
+    assert np.all(lo < seam_centers[0]) and np.all(hi > seam_centers[0])
+    assert plan['accepted'] is retry_ok
+    assert len(plan['rejected_passes']) == (1 if retry_ok else 2)
+    assert abs(out.computeBoundingBox().center().x-translation.x) < .05
+    assert engine.valid(engine.diagnostics(out, mm))
+    if not retry_ok:
+        assert report['voxel_passes'][-1].get('field_evaluation') != 'surface_band_with_full_hole_boxes'
+
+
+def test_separated_hole_guards_bound_total_solid_angle():
+    # Many holes on separate pieces. The common area bound would cover more
+    # than the allowed volume; each fan is small relative to its neighbours.
+    mesh = mm.Mesh()
+    for i in range(5):
+        for j in range(4):
+            for k in range(4):
+                part = mm.makeCube(mm.Vector3f.diagonal(.1), mm.Vector3f(i, j, k))
+                part.topology.deleteFace(mm.FaceId(0))
+                mesh.addMesh(part)
+    q = .01
+    boxes, info = winding.hole_field_boxes(mesh, mm, q)
+    assert len(boxes) == 80 and info['guard_bound'] == 'nearest_fan_separation'
+    assert info['box_volume_fraction_upper_bound'] < .15
+    raw = []
+    areas = []
+    for edge in mesh.topology.findHoleRepresentiveEdges():
+        loop = mm.trackRightBoundaryLoop(mesh.topology, edge)
+        pts = np.array([list(mesh.points[mesh.topology.org(e)]) for e in loop])
+        raw.append((pts.min(axis=0), pts.max(axis=0)))
+        areas.append(.5*np.linalg.norm(np.cross(pts[1]-pts[0], pts[2]-pts[0])))
+    raw = np.asarray(raw)
+    for p in np.random.default_rng(5).uniform(-.2, 4.5, (250, 3)):
+        if np.any(((p >= boxes[:, 0]) & (p <= boxes[:, 1])).all(axis=1)):
+            continue
+        gap = np.maximum(0, np.maximum(raw[:, 0]-p, p-raw[:, 1]))
+        assert np.sum(areas/np.einsum('ij,ij->i', gap, gap)) <= 4*np.pi*.125

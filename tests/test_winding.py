@@ -116,3 +116,38 @@ def test_original_torus_handle_is_preserved():
     report = {}
     out, checked = close_voxel_handle(mesh, info, info, mesh, mm, .015, report)
     assert out is mesh and checked == info and not report
+
+
+@pytest.mark.parametrize('fail', [True, False])
+def test_prefetch_produces_the_same_surface_and_joins_worker(fail):
+    from threading import current_thread
+    mesh = mm.makeCube(mm.Vector3f(.7, .6, .9))
+    params = mm.OffsetParameters()
+    params.voxelSize = .052
+    params.closeHolesInHoleWindingNumber = True
+    kernel = mm.FastWindingNumber(mesh)
+    threads = set()
+
+    class Device:
+        def calcFromGridWithDistances(self, *args):
+            if current_thread() is not main:
+                threads.add(current_thread())
+                if fail:
+                    raise RuntimeError('field worker failure')
+            kernel.calcFromGridWithDistances(*args)
+
+    main = current_thread()
+    events = []
+    if fail:
+        with pytest.raises(RuntimeError, match='field worker failure'):
+            winding_slabs(mesh, mm, Device(), params, events.append, budget=710, prefetch=True)
+    else:
+        output = winding_slabs(mesh, mm, Device(), params, events.append, budget=710, prefetch=True)
+        serial_events = []
+        reference = winding_slabs(mesh, mm, kernel, params, serial_events.append, budget=710)
+        assert all(event['prefetch'] for event in events)
+        for key in ['winding_samples', 'completed_blocks', 'completed_layers']:
+            assert events[-1][key] == serial_events[-1][key]
+        assert diagnostics(output, mm) == diagnostics(reference, mm)
+        assert mm.findMaxDistanceSq(mm.MeshPart(output), mm.MeshPart(reference)) < 1e-12
+    assert len(threads) == 1 and not next(iter(threads)).is_alive()
